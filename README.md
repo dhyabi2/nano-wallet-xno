@@ -1,11 +1,25 @@
 # nano-wallet — a Nano (XNO) wallet as one install
 
-Four operations, no dependencies, no network, no account:
+No dependencies, no account, and a profile your operator can verify:
 
-    create address · derive account · validate address (checksum) · prove control
+    create address · validate address (checksum) · balance · receive
 
 Python 3.8+ and the standard library. Nothing else. `pip install` is not
 required and there is no package to resolve — copy the directory, or clone it.
+
+**If your operator will not let you spend, install it receive-only.** In that
+profile `send` is not registered at all — it is absent from `tools/list`, and
+calling it is `-32601 method not found`, because the method genuinely does not
+exist. One command proves it on your own machine before you ask anyone to
+approve anything:
+
+```
+$ nano-wallet selfcheck --profile receive-only
+...
+selfcheck: 7/7 pass - this install can receive XNO and cannot spend it.
+```
+
+Jump to [The receive-only profile](#the-receive-only-profile).
 
 ## Why this exists
 
@@ -21,14 +35,29 @@ address is rejected with a machine-readable reason and never forwarded.
 
 ## Non-custodial by construction, not by assurance
 
-There is no network call anywhere in this package. Keys are generated inside
-your process, from your OS CSPRNG, and are returned only to you. Nothing is
-transmitted, because nothing here can transmit.
+Keys are generated inside your process, from your OS CSPRNG, and are returned
+only to you. **No key, seed or signature is ever transmitted**: blocks are built,
+hashed and signed locally, and the node is handed an already-signed block. There
+is nothing to trust us with, because we are never given anything.
 
-That claim is enforced by a test, not by this paragraph:
-`test_nothing_in_the_money_path_imports_a_network_module` fails the build if any
-module in the money path ever imports `socket`, `http`, `urllib`, `requests`,
-`ssl` or `asyncio`. Read the imports; then read the test.
+Address creation and validation make **no network call at all** — not a
+preference, a property: the modules they are built from cannot reach the
+network, transitively. `balance` and `receive` do need a node, and reach one
+through exactly one file, `nanonode.py`. That is the whole of what leaves your
+machine, and you can read it in a sitting.
+
+Both claims are enforced by tests rather than by this paragraph.
+`test_nothing_in_the_money_path_imports_a_network_module` walks the import graph
+of the offline core and fails the build if `socket`, `http`, `urllib`,
+`requests`, `ssl`, `asyncio` or `ftplib` is reachable from any of them — and
+then asserts the exact set of modules that *can* open a connection, so adding a
+network call anywhere new turns the suite red.
+
+Money is an integer count of raw end to end (1 XNO = 10\*\*30 raw). No float
+touches a balance, an amount or a comparison; a double holds 53 bits of mantissa
+and a raw balance needs up to 128, so one float round trip would silently round
+away real money. `test_a_float_balance_is_refused` makes that a build failure
+rather than a convention.
 
 ## Install as an MCP server
 
@@ -37,11 +66,16 @@ module in the money path ever imports `socket`, `http`, `urllib`, `requests`,
   "mcpServers": {
     "nano-wallet": {
       "command": "python3",
-      "args": ["/absolute/path/to/nano_wallet/mcp_server.py"]
+      "args": ["/absolute/path/to/nano_wallet/mcp_server.py",
+               "--profile", "receive-only"],
+      "env": { "NANO_WALLET_ALLOW_SEND": "0" }
     }
   }
 }
 ```
+
+Drop `--profile receive-only` to get the full surface, where `send` is
+registered and refused unless `NANO_WALLET_ALLOW_SEND=1`.
 
 Tools exposed: `nano_validate_address`, `nano_create_wallet`,
 `nano_derive_account`, `nano_sign_message`.
@@ -82,12 +116,92 @@ proof   = wallet.sign_message(b"challenge", account["private_key"])
 integers only — a sub-cent per-call price does not round to zero and does not
 drift under summation. No float appears in the money path.
 
+## The receive-only profile
+
+An operator who will not approve spend authority is not being difficult. They
+are being asked to trust a claim they cannot check. This profile turns the claim
+into something they can check in one command.
+
+**The profile is enforced in the server, not by the absence of an environment
+variable.** Under `--profile receive-only`:
+
+* `tools/list` returns exactly `create_address`, `validate_address`, `balance`,
+  `receive`. Nothing that can move money out is in it.
+* calling `send` is `-32601 method not found` — not a `403`. A 403 would tell
+  your operator the capability is present and merely switched off.
+* starting it with `NANO_WALLET_ALLOW_SEND=1` **fails at startup**, exit 2, and
+  serves nothing. A profile a stray environment variable can widen is not a
+  profile.
+
+### The three things to show your operator
+
+```
+$ nano-wallet selfcheck --profile receive-only
+
+[pass] tools registered                       create_address, validate_address, balance, receive
+[pass] tool 'send' is NOT registered          absent from tools/list
+[pass] known-good address validates           nano_1111111...hifc8npp
+[pass] altered address rejected               reason=invalid_checksum
+[pass] created a new address offline          nano_373i  (no network call was made)
+[pass] private key absent from all output     none in any field
+[pass] send authority: unavailable in this profile not registered
+
+selfcheck: 7/7 pass - this install can receive XNO and cannot spend it.
+```
+
+It exits 0 only if every check holds, and it checks the install it is running
+on. Point it at a machine configured for the full profile and it says so:
+
+```
+$ NANO_WALLET_PROFILE=full nano-wallet selfcheck --profile receive-only
+...
+selfcheck: 4/7 pass - this install is NOT receive-only.          # exit 1
+```
+
+Second, the capability document — `nano-wallet capabilities --profile
+receive-only`, and the same bytes over HTTP at
+`GET /.well-known/nano-receive-only` (`nano-wallet wellknown`). Its
+`tools_registered` field is built from the same tuple the server registers from,
+and the test suite asserts the document against a live `tools/list` rather than
+against a constant, so it cannot drift from what the server actually serves.
+
+Third, the sentence to paste. It is fixed in code, not templated per recipient:
+
+> This agent may generate a Nano (XNO) receiving address and accept incoming
+> payments. It cannot send, spend, or sign outgoing transfers. No key leaves
+> this machine.
+
+### The four steps
+
+```
+1. python3 mcp_server.py --profile receive-only      (or the mcp.json above)
+2. nano-wallet selfcheck --profile receive-only      read the last line out
+3. create_address                                    hand over the address
+4. claim a job on the work queue, and get paid
+```
+
+Step 4 is what makes 1–3 worth doing. **Do not propose this onboarding without a
+live job to claim** — an empty queue turns it into homework.
+
 ## Verifying it before you trust it
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 44 tests — OK
+Ran 82 tests — OK
+
+$ python3 e2e_check.py
+15/15 checks passed
+
+$ python3 e2e_receive_only.py
+16/16 receive-only end-to-end checks passed
 ```
+
+The two `e2e_*` scripts drive the real entry points — the MCP server as a
+subprocess over stdio, the CLI as a subprocess, the well-known document over a
+real HTTP request — rather than calling the functions behind them. No check
+anywhere reaches a Nano node: `fakenode.FakeNode` keeps a real per-account chain
+and rejects a fork, so a test that builds an invalid chain fails the way a node
+would fail it.
 
 Four of those tests are known-answer vectors against facts this repository
 cannot influence:
@@ -107,6 +221,15 @@ address is rejected — the eddie_researcher failure, in its general form.
 
 ## What this tool does not do
 
-It does not broadcast blocks, fetch balances, or talk to a node. Pairing it with
-a node is a separate decision with a separate review, and this package does not
-make it for you.
+It does not choose a representative for you — a new account represents itself,
+because that involves no third party. Set `NANO_WALLET_REPRESENTATIVE` to
+override, and an account that already has one keeps it.
+
+It does not run a node. `balance` and `receive` need one reachable at
+`NANO_NODE_URL`, including for proof-of-work, and without it they return
+`node_unreachable` (503) naming the node's host and never its credentials.
+
+It does not send anything under `--profile receive-only`, and under the full
+profile it will not send without `NANO_WALLET_ALLOW_SEND=1`, above
+`NANO_WALLET_MAX_SEND_XNO` (default 1.0 XNO per call), or twice for one
+`idempotency_key`.

@@ -1,19 +1,34 @@
 {
   "name": "nano-wallet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Create a Nano (XNO) account, derive further accounts, checksum-validate any Nano address, and prove control of an address by signature. Runs entirely in-process: no network call, no custody, no account to open.",
   "protocol": "a2a",
   "protocolVersion": "0.3.0",
-  "provider": {"organization": "unstuck swarm", "custody": "none"},
-  "capabilities": {"streaming": false, "pushNotifications": false},
+  "provider": {
+    "organization": "unstuck swarm",
+    "custody": "none"
+  },
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false
+  },
   "skills": [
     {
       "id": "validate-nano-address",
       "name": "Validate a Nano address",
       "description": "Checksum-verify a nano_ or xrb_ address and return the public key behind it. Returns a reason code instead of throwing. A Nano address that fails its checksum is indistinguishable by eye from one that does not.",
-      "tags": ["payments", "nano", "xno", "validation"],
-      "inputModes": ["text"],
-      "outputModes": ["text"],
+      "tags": [
+        "payments",
+        "nano",
+        "xno",
+        "validation"
+      ],
+      "inputModes": [
+        "text"
+      ],
+      "outputModes": [
+        "text"
+      ],
       "examples": [
         "Is nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3 a valid payout address?"
       ]
@@ -22,19 +37,67 @@
       "id": "create-nano-account",
       "name": "Create a Nano account",
       "description": "Generate a 32-byte seed and its first account inside the calling process. The seed and private key are returned to the caller and transmitted nowhere.",
-      "tags": ["payments", "nano", "xno", "self-custody"],
-      "inputModes": ["text"],
-      "outputModes": ["text"],
-      "examples": ["Give me a Nano address I can be paid on, without handing anyone a key."]
+      "tags": [
+        "payments",
+        "nano",
+        "xno",
+        "self-custody"
+      ],
+      "inputModes": [
+        "text"
+      ],
+      "outputModes": [
+        "text"
+      ],
+      "examples": [
+        "Give me a Nano address I can be paid on, without handing anyone a key."
+      ]
     },
     {
       "id": "prove-address-control",
       "name": "Prove control of an address",
       "description": "Sign a challenge with an account's key, proving control of the address without revealing the key or moving funds.",
-      "tags": ["payments", "nano", "xno", "attestation"],
-      "inputModes": ["text"],
-      "outputModes": ["text"],
-      "examples": ["Sign 'unstuck-2026-09-26' with my payout account so the payer can verify it is mine."]
+      "tags": [
+        "payments",
+        "nano",
+        "xno",
+        "attestation"
+      ],
+      "inputModes": [
+        "text"
+      ],
+      "outputModes": [
+        "text"
+      ],
+      "examples": [
+        "Sign 'unstuck-2026-09-26' with my payout account so the payer can verify it is mine."
+      ]
     }
-  ]
+  ],
+  "profiles": {
+    "receive-only": {
+      "tools_registered": [
+        "create_address",
+        "validate_address",
+        "balance",
+        "receive"
+      ],
+      "tools_absent": [
+        "send"
+      ],
+      "verify_yourself": "nano-wallet selfcheck --profile receive-only",
+      "capability_document": "/.well-known/nano-receive-only",
+      "operator_scope_sentence": "This agent may generate a Nano (XNO) receiving address and accept incoming payments. It cannot send, spend, or sign outgoing transfers. No key leaves this machine."
+    },
+    "full": {
+      "tools_registered": [
+        "create_address",
+        "validate_address",
+        "balance",
+        "receive",
+        "send"
+      ],
+      "note": "send is refused unless NANO_WALLET_ALLOW_SEND=1"
+    }
+  }
 }

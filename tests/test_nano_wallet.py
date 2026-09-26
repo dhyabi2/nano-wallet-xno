@@ -198,17 +198,60 @@ class TestWallet(unittest.TestCase):
         self.assertEqual(len(signed["signature"]), 128)
 
     def test_nothing_in_the_money_path_imports_a_network_module(self):
-        """The custody claim, stated as a test rather than a promise."""
-        forbidden = {"socket", "http", "urllib", "requests", "ssl", "asyncio"}
+        """The custody claim, stated as a test rather than a promise.
+
+        Checked TRANSITIVELY. 1.0.0 grepped each file for `import urllib`,
+        which stopped being enough the moment 1.1.0 added a node client:
+        a module that imports a module that imports urllib reaches the
+        network just as well as one that imports it directly.
+        """
+        import ast
+        forbidden = {"socket", "http", "urllib", "requests", "ssl", "asyncio", "ftplib"}
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for name in ("nanoaddr.py", "ed25519_blake2b.py", "wallet.py", "mcp_server.py"):
-            with open(os.path.join(here, name)) as handle:
-                source = handle.read()
-            for module in forbidden:
-                self.assertNotIn(
-                    "import %s" % module, source,
-                    "%s imports %s - this package must never reach the network" % (name, module),
-                )
+
+        def imports_of(module):
+            with open(os.path.join(here, module + ".py")) as handle:
+                tree = ast.parse(handle.read())
+            found = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    found.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    found.add(node.module.split(".")[0])
+            return found
+
+        def reachable(start):
+            seen, todo = set(), [start]
+            while todo:
+                name = todo.pop()
+                if name in seen:
+                    continue
+                seen.add(name)
+                if os.path.exists(os.path.join(here, name + ".py")):
+                    todo.extend(imports_of(name))
+            return seen
+
+        # The offline core. `mcp_server` is deliberately NOT here: balance and
+        # receive need a node, and it reaches one through `nanonode`. What holds
+        # for it instead is the assertion below.
+        for name in ("nanoaddr", "ed25519_blake2b", "wallet", "blocks", "keystore",
+                     "profiles", "capabilities"):
+            leaks = sorted(reachable(name) & forbidden)
+            self.assertEqual(leaks, [], "%s can reach %s" % (name, leaks))
+
+        # And exactly one module in the wallet opens a connection to a node.
+        # e2e_* are the acceptance harnesses, not part of the installed package.
+        network_capable = sorted(
+            name[:-3] for name in os.listdir(here)
+            if name.endswith(".py") and not name.startswith("e2e_")
+            and imports_of(name[:-3]) & forbidden
+        )
+        self.assertEqual(
+            network_capable, ["nanonode", "selfcheck", "wellknown"],
+            "the set of network-touching modules changed: %s. nanonode speaks to the "
+            "node, wellknown serves one read-only document, and selfcheck imports "
+            "socket only to BLOCK it." % network_capable,
+        )
 
 
 class TestAmounts(unittest.TestCase):
@@ -246,11 +289,17 @@ class TestMcpServer(unittest.TestCase):
         )
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "nano-wallet")
         names = [t["name"] for t in responses[1]["result"]["tools"]]
+        # 1.1.0 added profiles (specs/agent-tool-receive-only-onboarding.md). The
+        # default profile now also registers the spec-named tools and the gated
+        # `send`; the four names 1.0.0 shipped are still here, unchanged and in
+        # the same relative order, so a client written against 1.0.0 is unaffected.
         self.assertEqual(
             names,
-            ["nano_validate_address", "nano_create_wallet",
+            ["create_address", "validate_address", "balance", "receive", "send",
+             "nano_validate_address", "nano_create_wallet",
              "nano_derive_account", "nano_sign_message"],
         )
+        self.assertEqual(responses[0]["result"]["serverInfo"]["profile"], "full")
 
     def test_every_advertised_tool_is_callable(self):
         for tool in mcp_server.TOOLS:
@@ -288,7 +337,11 @@ class TestMcpServer(unittest.TestCase):
              "params": {"name": "nano_send_everything", "arguments": {}}},
             {"jsonrpc": "2.0", "id": 7, "method": "wallet/drain"},
         )
-        self.assertEqual(responses[0]["error"]["code"], -32602)
+        # A tool that is not registered is -32601 method not found, the same answer
+        # as a method that was never defined. 1.0.0 answered -32602 here; the
+        # receive-only profile turns "this tool is absent" into a load-bearing
+        # statement, and -32602 (invalid params) would imply the tool exists.
+        self.assertEqual(responses[0]["error"]["code"], -32601)
         self.assertEqual(responses[1]["error"]["code"], -32601)
 
     def test_notifications_get_no_response(self):

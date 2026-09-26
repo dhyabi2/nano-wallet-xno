@@ -7,10 +7,12 @@ Run this before trusting the tool with an address you intend to be paid on:
 """
 
 import json
+import os
 import subprocess
 import sys
 
 import nanoaddr
+import profiles
 import wallet
 
 BURN = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
@@ -104,7 +106,7 @@ def _():
     assert bad.returncode == 1 and json.loads(bad.stdout)["reason"] == "bad_checksum"
 
 
-@check("the MCP server handshakes and advertises exactly four tools")
+@check("the MCP server handshakes and advertises exactly its profile's tools")
 def _():
     requests = (
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
@@ -114,16 +116,67 @@ def _():
                           capture_output=True, text=True)
     lines = [json.loads(line) for line in proc.stdout.splitlines()]
     assert lines[0]["result"]["serverInfo"]["name"] == "nano-wallet"
-    assert len(lines[1]["result"]["tools"]) == 4
+    names = [tool["name"] for tool in lines[1]["result"]["tools"]]
+    assert names == list(profiles.tools_for(profiles.DEFAULT_PROFILE)), names
 
 
-@check("no module in the money path can reach the network")
+#: Every module that must be unable to reach the network, checked TRANSITIVELY:
+#: it is not enough that they do not import urllib themselves, because an import
+#: two hops away reaches the network just as well.
+OFFLINE_MODULES = ("nanoaddr", "ed25519_blake2b", "wallet", "blocks", "keystore",
+                   "profiles", "capabilities")
+
+NETWORK_MODULES = ("socket", "http", "urllib", "requests", "ssl", "asyncio", "ftplib")
+
+
+def _imports_of(module_name):
+    import ast
+    with open(module_name + ".py") as handle:
+        tree = ast.parse(handle.read())
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            found.add(node.module.split(".")[0])
+    return found
+
+
+def _reachable(start):
+    seen, todo = set(), [start]
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        if os.path.exists(name + ".py"):
+            todo.extend(_imports_of(name))
+    return seen
+
+
+@check("no module in the money path can reach the network, transitively")
 def _():
-    for name in ("nanoaddr.py", "ed25519_blake2b.py", "wallet.py", "mcp_server.py"):
-        with open(name) as handle:
-            source = handle.read()
-        for module in ("socket", "http", "urllib", "requests", "ssl", "asyncio"):
-            assert "import %s" % module not in source, "%s imports %s" % (name, module)
+    for name in OFFLINE_MODULES:
+        reachable = _reachable(name)
+        leaks = sorted(reachable & set(NETWORK_MODULES))
+        assert not leaks, "%s can reach %s" % (name, ", ".join(leaks))
+
+
+#: nanonode.py speaks to the node; wellknown.py serves one read-only document.
+#: selfcheck.py imports socket only in order to BLOCK it - `no_sockets()` replaces
+#: socket.socket with something that raises, which is how check 5 proves that
+#: address creation made no network call rather than asserting it did not.
+EXEMPT = {"nanonode.py", "wellknown.py", "selfcheck.py",
+          "e2e_check.py", "e2e_receive_only.py", "fakenode.py"}
+
+
+@check("nanonode.py is the ONLY module in the wallet that touches the network")
+def _():
+    for name in os.listdir("."):
+        if not name.endswith(".py") or name in EXEMPT:
+            continue
+        direct = _imports_of(name[:-3]) & set(NETWORK_MODULES)
+        assert not direct, "%s imports %s directly" % (name, ", ".join(sorted(direct)))
 
 
 def main():
