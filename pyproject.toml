@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-wallet-xno"
+version = "1.0.0"
+description = "Nano (XNO) wallet as one install: create, derive, checksum-validate, prove control. No dependencies, no network, no custody."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+keywords = ["nano", "xno", "wallet", "mcp", "a2a", "agent", "payments", "x402"]
+
+[project.scripts]
+nano-wallet = "cli:main"
+
+[tool.setuptools]
+py-modules = ["nanoaddr", "ed25519_blake2b", "wallet", "cli", "mcp_server"]
