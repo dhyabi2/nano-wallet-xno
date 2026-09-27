@@ -9,7 +9,27 @@ permissions:
   id-token: write
 
 jobs:
+  # A release published this package to PyPI without running a single test. A
+  # wallet is the wrong place to find that out afterwards, so the suite gates the
+  # build; test.yml runs the same steps on every push and pull request.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+      - name: End-to-end checks
+        run: python3 e2e_check.py
+      - name: Receive-only end-to-end checks
+        run: python3 e2e_receive_only.py
+      - name: Receive-only selfcheck
+        run: python3 selfcheck.py
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

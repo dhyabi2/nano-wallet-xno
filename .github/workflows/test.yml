@@ -1,0 +1,46 @@
+name: test
+
+# This repository shipped with only publish.yml, which runs on a release. So the
+# suite below - 82 unit tests, 31 end-to-end checks and the receive-only
+# selfcheck - had never once run on a runner, on any commit, while the package
+# was published to PyPI. Green locally is not a green tick.
+#
+# The matrix is 3.10-3.13, the four the sibling repositories run and prove.
+# pyproject.toml declares requires-python = ">=3.8"; nothing here checks 3.8 or
+# 3.9, and ubuntu-latest no longer ships 3.8, so that floor stays a claim. It is
+# reported rather than quietly narrowed, because the code carries no syntax that
+# needs 3.10.
+#
+# Deliberately no 64-hex secret guard, unlike the sibling ledger: the known-answer
+# vectors in tests/ are 64-hex by nature - the all-zero seed, the mainnet genesis
+# public key, RFC 8032 vector 1 - and a guard that flags its own test vectors is
+# a guard people learn to ignore.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: End-to-end checks
+        run: python3 e2e_check.py
+      - name: Receive-only end-to-end checks
+        run: python3 e2e_receive_only.py
+      - name: Receive-only selfcheck
+        run: python3 selfcheck.py
