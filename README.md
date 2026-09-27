@@ -183,11 +183,57 @@ Third, the sentence to paste. It is fixed in code, not templated per recipient:
 Step 4 is what makes 1–3 worth doing. **Do not propose this onboarding without a
 live job to claim** — an empty queue turns it into homework.
 
+## Let your operator set a spend cap once
+
+"Standing latitude to operate, but not to spend" is where most agents stop.
+An **operator mandate** turns it into a permission the operator signs once,
+with the same Nano key that holds their XNO: which agent may spend, a total
+cap and a per-payment max in raw integer strings (1 XNO = 10\*\*30 raw), an
+optional payee allow-list, a required `purpose` saying what the spend buys,
+and an expiry. `mandate.py` is one standard-library file (vendored,
+byte-for-byte, from `agent-wallet-multirail`; a test pins the bytes).
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install "git+https://github.com/dhyabi2/nano-wallet-xno"
+mandate keygen --out operator.key   # demo operator key (mode 600); a real operator uses their own
+mandate create --operator-key operator.key --agent nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7 --total-cap-xno 0.5 --per-payment-max-xno 0.01 --purpose "Web-search API calls for the research task" --days 30 --out mandate.json
+mandate verify mandate.json
+mandate status mandate.json         # remaining cap, from mandate.json.ledger.json
+```
+
+(The agent address above is a well-known test address - put your agent's
+there.) Then start the full profile with the mandate:
+
+```
+NANO_WALLET_ALLOW_SEND=1 NANO_WALLET_MANDATE=/abs/path/mandate.json python3 mcp_server.py --profile full
+```
+
+Every `send` from the mandate's agent is then checked - signature, agent,
+expiry, per-payment max, payee allow-list, remaining cap - before a block is
+signed, and reserved in the ledger before it is broadcast. A refusal is
+`mandate_refused` (403) with `mandate_reason` (`cap_exhausted`,
+`over_per_payment_max`, `payee_not_allowed`, `expired`, `bad_signature`,
+`wrong_agent`, ...), and nothing is broadcast. A configured mandate that
+cannot be read or verified refuses; it never falls back to sending uncapped.
+`NANO_WALLET_REQUIRE_MANDATE=1` refuses every send that has no mandate.
+`NANO_WALLET_MANDATE_LEDGER` moves the ledger. A broadcast that fails stays
+counted, because it may have landed.
+
+The ledger is local: it stops this runtime from overspending, not someone
+with shell access who deletes it. For a hard ceiling, also fund the agent's
+account with no more than the cap.
+
+**Audit (2026-09-27):** before this change the only spend control was the
+per-call limit `NANO_WALLET_MAX_SEND_XNO` (default 1.0 XNO), which is enforced
+in code as documented. There was no cumulative cap, no payee allow-list and no
+expiry; the README never claimed one. The per-call limit still applies on top
+of any mandate.
+
 ## Verifying it before you trust it
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 84 tests — OK
+Ran 98 tests — OK
 
 $ python3 e2e_check.py
 15/15 checks passed
@@ -231,5 +277,5 @@ It does not run a node. `balance` and `receive` need one reachable at
 
 It does not send anything under `--profile receive-only`, and under the full
 profile it will not send without `NANO_WALLET_ALLOW_SEND=1`, above
-`NANO_WALLET_MAX_SEND_XNO` (default 1.0 XNO per call), or twice for one
-`idempotency_key`.
+`NANO_WALLET_MAX_SEND_XNO` (default 1.0 XNO per call), outside an operator
+mandate when one is configured, or twice for one `idempotency_key`.

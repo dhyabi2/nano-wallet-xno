@@ -427,12 +427,18 @@ class TestHelpNamesSomethingThatExists(unittest.TestCase):
                     "module, so the reader gets 'No module named %s'"
                     % (module, module))
 
-    def test_the_help_names_the_console_script_pyproject_installs(self):
-        """The one invocation every installed user definitely has.
+    def test_the_help_names_the_console_script_that_runs_this_module(self):
+        """The invocation that reaches *this* help, read out of pyproject.toml.
 
-        Read out of pyproject.toml rather than restated, so renaming the script
-        without updating the help turns this red. Parsed with a regex, not
-        tomllib, because this package supports Python 3.8.
+        Deliberately only the script whose target is `cli:main`. The project
+        installs others -- `mandate` is its own command with its own entry
+        point -- and cli.py's help has no business naming them; an earlier
+        version of this law demanded every script appear here and went red the
+        moment a second one was added, which was the law being wrong, not the
+        help. Reading the name rather than restating it still turns this red if
+        the script is renamed without updating the help.
+
+        Parsed with a regex, not tomllib, because this package supports 3.8.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
@@ -440,10 +446,13 @@ class TestHelpNamesSomethingThatExists(unittest.TestCase):
         scripts = re.search(r"\[project\.scripts\](.*?)(?:\n\[|\Z)",
                             pyproject, re.S)
         self.assertIsNotNone(scripts, "pyproject.toml has no [project.scripts]")
-        names = re.findall(r"^\s*([A-Za-z0-9_.-]+)\s*=", scripts.group(1), re.M)
-        self.assertTrue(names, "[project.scripts] declares no console script")
+        mine = re.findall(r"""^\s*([A-Za-z0-9_.-]+)\s*=\s*['"]cli:main['"]""",
+                          scripts.group(1), re.M)
+        self.assertTrue(
+            mine, "[project.scripts] has no entry pointing at cli:main, so the "
+                  "command that prints this help can no longer be named")
         first_line = self.help_text().strip().splitlines()[0]
-        for name in names:
+        for name in mine:
             with self.subTest(script=name):
                 self.assertIn(name, first_line)
 

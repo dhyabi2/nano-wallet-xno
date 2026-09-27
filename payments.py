@@ -12,6 +12,7 @@ import os
 
 import blocks
 import keystore as _keystore
+import mandate as _mandate
 import nanoaddr as _addr
 import nanonode
 import profiles
@@ -258,6 +259,13 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
             )
         return dict(previous_call["result"], replayed=True)
 
+    guard = _mandate_guard(env, source)  # after the replay: a replay sends nothing
+    if guard is not None:
+        try:  # refuse before anything is signed; spend() re-checks at broadcast
+            guard.check(destination, amount_raw)
+        except _mandate.MandateRefused as exc:
+            raise _mandate_refusal(exc) from None
+
     try:
         private_key = keys.get(source)
     except _keystore.KeyStoreError as exc:
@@ -281,7 +289,15 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
                                      balance_raw - amount_raw, destination_pk, "send")
         signed["work"] = node.work_generate(signed.pop("_work_root"))
         block_hash = signed.pop("_hash")
-        node.process(dict(signed))
+        if guard is None:
+            node.process(dict(signed))
+        else:
+            # Reserved in the mandate ledger BEFORE the block is broadcast; a
+            # broadcast that raises stays counted, because it may have landed.
+            guard.spend(destination, amount_raw, lambda: node.process(dict(signed)),
+                        ref=str(idempotency_key))
+    except _mandate.MandateRefused as exc:
+        raise _mandate_refusal(exc) from None
     except nanonode.NodeError as exc:
         raise ToolError(exc.reason, exc.message, 503) from None
 
@@ -295,6 +311,37 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
     sent[str(idempotency_key)] = {"to": destination, "amount_raw": amount_raw,
                                   "result": result}
     return dict(result)
+
+
+# ---------------------------------------------------------------- operator mandate
+
+def _mandate_guard(env, source: str):
+    """The operator's signed spend cap for `source`, or None when none is configured.
+
+    NANO_WALLET_MANDATE           path to a signed mandate (see mandate.py)
+    NANO_WALLET_MANDATE_LEDGER    its spend ledger (default: <mandate>.ledger.json)
+    NANO_WALLET_REQUIRE_MANDATE=1 refuse every send that has no mandate
+
+    A configured mandate that does not verify - bad signature, another agent,
+    expired, unreadable - refuses the send. It never falls back to no mandate.
+    """
+    path = str(env.get("NANO_WALLET_MANDATE", "") or "").strip()
+    if not path:
+        if str(env.get("NANO_WALLET_REQUIRE_MANDATE", "")).strip() == "1":
+            raise ToolError("mandate_required",
+                            "NANO_WALLET_REQUIRE_MANDATE=1 and no NANO_WALLET_MANDATE is set: "
+                            "this install sends only under an operator-signed mandate", 403)
+        return None
+    try:
+        return _mandate.MandateGuard.from_file(
+            path, str(env.get("NANO_WALLET_MANDATE_LEDGER", "") or "").strip() or None, agent=source)
+    except _mandate.MandateRefused as exc:
+        raise _mandate_refusal(exc) from None
+
+
+def _mandate_refusal(exc) -> ToolError:
+    return ToolError("mandate_refused", "operator mandate refused this send: %s" % exc.message,
+                     403, mandate_reason=exc.reason)
 
 
 # ---------------------------------------------------------------- helpers
