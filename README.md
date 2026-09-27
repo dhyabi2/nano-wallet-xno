@@ -5,7 +5,16 @@ No dependencies, no account, and a profile your operator can verify:
     create address · validate address (checksum) · balance · receive
 
 Python 3.8+ and the standard library. Nothing else. `pip install` is not
-required and there is no package to resolve — copy the directory, or clone it.
+required and there is no package to resolve — copy the directory, or clone it,
+and run `python3 cli.py <command>` from inside it. If you want the `nano-wallet`
+command used below on your PATH, one line installs it (no dependencies):
+
+```
+pip install git+https://github.com/dhyabi2/nano-wallet-xno
+```
+
+Every `nano-wallet <command>` in this README is the same as
+`python3 cli.py <command>` from a clone.
 
 **If your operator will not let you spend, install it receive-only.** In that
 profile `send` is not registered at all — it is absent from `tools/list`, and
@@ -14,7 +23,7 @@ exist. One command proves it on your own machine before you ask anyone to
 approve anything:
 
 ```
-$ nano-wallet selfcheck --profile receive-only
+$ python3 cli.py selfcheck --profile receive-only     # or: nano-wallet selfcheck ...
 ...
 selfcheck: 7/7 pass - this install can receive XNO and cannot spend it.
 ```
@@ -175,7 +184,7 @@ Third, the sentence to paste. It is fixed in code, not templated per recipient:
 
 ```
 1. python3 mcp_server.py --profile receive-only      (or the mcp.json above)
-2. nano-wallet selfcheck --profile receive-only      read the last line out
+2. python3 cli.py selfcheck --profile receive-only   read the last line out
 3. create_address                                    hand over the address
 4. claim a job on the work queue, and get paid
 ```
