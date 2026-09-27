@@ -10,9 +10,11 @@ influence, so they prove the implementation rather than restate it:
   * the all-zero seed pins Nano's BLAKE2b variant of that same arithmetic
 """
 
+import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -392,6 +394,58 @@ class TestCli(unittest.TestCase):
         self.assertEqual(self.run_cli("nonsense")[0], 2)
         self.assertEqual(self.run_cli()[0], 0)
 
+
+
+class TestHelpNamesSomethingThatExists(unittest.TestCase):
+    """`--help` is the first thing a new install prints. It must not name a
+    command that does not exist.
+
+    It did: the first line read `python3 -m nano_wallet <command>`, and there is
+    no `nano_wallet` module in this package or in the wheel it builds -- the
+    modules are installed flat (`cli`, `wallet`, ...) and the entry point users
+    actually get is the `nano-wallet` console script from `[project.scripts]`.
+    A reader who copied that first line got "No module named nano_wallet".
+    """
+
+    def help_text(self):
+        buffer = io.StringIO()
+        stdout, sys.stdout = sys.stdout, buffer
+        try:
+            self.assertEqual(cli.main(["--help"]), 0)
+        finally:
+            sys.stdout = stdout
+        return buffer.getvalue()
+
+    def test_every_module_the_help_offers_is_importable(self):
+        offered = re.findall(r"python3?\s+-m\s+([A-Za-z_][A-Za-z0-9_.]*)",
+                             self.help_text())
+        for module in offered:
+            with self.subTest(module=module):
+                self.assertIsNotNone(
+                    importlib.util.find_spec(module),
+                    "--help offers `python3 -m %s`, which is not an importable "
+                    "module, so the reader gets 'No module named %s'"
+                    % (module, module))
+
+    def test_the_help_names_the_console_script_pyproject_installs(self):
+        """The one invocation every installed user definitely has.
+
+        Read out of pyproject.toml rather than restated, so renaming the script
+        without updating the help turns this red. Parsed with a regex, not
+        tomllib, because this package supports Python 3.8.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+            pyproject = fh.read()
+        scripts = re.search(r"\[project\.scripts\](.*?)(?:\n\[|\Z)",
+                            pyproject, re.S)
+        self.assertIsNotNone(scripts, "pyproject.toml has no [project.scripts]")
+        names = re.findall(r"^\s*([A-Za-z0-9_.-]+)\s*=", scripts.group(1), re.M)
+        self.assertTrue(names, "[project.scripts] declares no console script")
+        first_line = self.help_text().strip().splitlines()[0]
+        for name in names:
+            with self.subTest(script=name):
+                self.assertIn(name, first_line)
 
 if __name__ == "__main__":
     unittest.main()

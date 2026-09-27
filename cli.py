@@ -1,4 +1,4 @@
-"""Command line entry point: python3 -m nano_wallet <command>
+"""Command line entry point: nano-wallet <command>
 
     check <address>             checksum-verify an address (exit 0 valid, 1 invalid)
     new                         generate a seed and an account, locally

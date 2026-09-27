@@ -187,7 +187,7 @@ live job to claim** — an empty queue turns it into homework.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 82 tests — OK
+Ran 84 tests — OK
 
 $ python3 e2e_check.py
 15/15 checks passed
