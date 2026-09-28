@@ -233,7 +233,7 @@ of any mandate.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 96 tests — OK
+Ran 98 tests — OK
 
 $ python3 e2e_check.py
 15/15 checks passed
