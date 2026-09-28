@@ -93,6 +93,8 @@ TOOL_DEFINITIONS = {
         "name": "send",
         "description": (
             "Send XNO. Refused with spend_not_enabled unless NANO_WALLET_ALLOW_SEND=1. "
+            "When NANO_WALLET_MANDATE names an operator-signed mandate, every send must also "
+            "fit its cap, per-payment max, payee allow-list and expiry (mandate_refused). "
             "Not registered at all under --profile receive-only."
         ),
         "inputSchema": {

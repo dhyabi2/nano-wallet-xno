@@ -13,8 +13,10 @@ keywords = ["nano", "xno", "wallet", "mcp", "a2a", "agent", "payments", "x402"]
 
 [project.scripts]
 nano-wallet = "cli:main"
+mandate = "mandate:main"
 
 [tool.setuptools]
 py-modules = ["nanoaddr", "ed25519_blake2b", "wallet", "cli", "mcp_server",
               "profiles", "capabilities", "selfcheck", "payments", "blocks",
-              "keystore", "nanonode", "fakenode", "wellknown"]
+              "keystore", "nanonode", "fakenode", "wellknown",
+              "mandate"]
