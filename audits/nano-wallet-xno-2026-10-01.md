@@ -135,3 +135,23 @@ and the selfcheck's socket guard are untouched.
 - **`pyproject.toml` declares `requires-python = ">=3.8"`** and nothing tests 3.8 or 3.9;
   `test.yml` says so itself. Unchanged by this run.
 - **The publish workflow** was not read or touched, by rule.
+
+## Addendum, 2026-10-03
+
+Rebuilt on `main` after #5 merged. The only conflict was the README's published count — this branch
+had 101 → 107, #5 moved it to 102, so the merged tree is **108**. Re-verified on the merge result,
+not on the old head: 108 unit tests OK, `e2e_check` 15/15, `e2e_receive_only` 16/16, `selfcheck`
+7/7, `py_compile` clean.
+
+**One thing this change broke that the original audit missed.** `mcp_server.py:73` advertised the
+`balance` tool as "Read an account's **confirmed** balance and what is waiting to be pocketed."
+That was true of `main`, which returned `confirmed_balance`. Switching to the tip's balance left
+the tool describing something it no longer returns — and an MCP tool description is exactly what an
+agent reads to decide what it may spend, so a stale one here is a wrong number handed to the thing
+making the decision. It now says the balance is the account's latest block and points at the
+`confirmed` flag beside it, which answers whether the network has confirmed that block.
+
+That was the whole blast radius of the switch outside `nanonode.py`: `grep` finds no other
+"confirmed balance" claim in `mcp_server.py`, `README.md` or `cli.py`, and `info["confirmed"]` is
+read in exactly one place (`payments.py:148`) and only to be reported back out of the `balance`
+read-out. Nothing gates a send or a receive on it.
