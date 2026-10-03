@@ -237,7 +237,24 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
     if amount_raw <= 0:
         raise ToolError("invalid_amount", "amount must be greater than zero")
 
-    limit_raw = wallet.xno_to_raw(env.get("NANO_WALLET_MAX_SEND_XNO") or DEFAULT_MAX_SEND_XNO)
+    # The operator's limit, not the agent's amount. It used to reach xno_to_raw
+    # unchecked, outside any try: a typo in the variable ("0.5 XNO", "1,5",
+    # "1e-3") raised a bare ValueError whose text reads "amount is not a decimal
+    # number" - a complaint about an amount the agent never sent, which it can
+    # only answer by trying other amounts, forever. Named here instead, as a
+    # refusal only the operator can clear.
+    try:
+        limit_raw = wallet.xno_to_raw(env.get("NANO_WALLET_MAX_SEND_XNO") or DEFAULT_MAX_SEND_XNO)
+    except ValueError as exc:
+        raise ToolError(
+            "misconfigured_send_limit",
+            "this install's send limit NANO_WALLET_MAX_SEND_XNO=%r is not an amount "
+            "in XNO (%s), so no amount can be checked against it. Nothing was sent, "
+            "and retrying with a different amount will not help: only the operator "
+            "can fix this."
+            % (env.get("NANO_WALLET_MAX_SEND_XNO"), exc),
+            403,
+        ) from None
     if amount_raw > limit_raw:
         raise ToolError(
             "send_limit_exceeded",

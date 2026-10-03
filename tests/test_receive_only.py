@@ -467,6 +467,32 @@ class SendIsGated(unittest.TestCase):
                                       "amount_xno": "0.6", "idempotency_key": "k2"})
         self.assertEqual(caught.exception.reason, "send_limit_exceeded")
 
+    def test_a_misconfigured_send_limit_is_named_and_not_blamed_on_the_amount(self):
+        """An operator typo in the limit must not read as a bad amount.
+
+        `NANO_WALLET_MAX_SEND_XNO` is parsed with the same exact parser as the
+        agent's amount, so a value like "0.5 XNO" used to raise a bare
+        ValueError reading "amount is not a decimal number: '0.5 XNO'". The
+        agent, which sent a perfectly good 0.1, can only read that as its own
+        amount being wrong and retry other amounts; none of them can work.
+        """
+        for bad in ("0.5 XNO", "1,5", "1e-3", "half"):
+            env = {"NANO_WALLET_ALLOW_SEND": "1", "NANO_WALLET_MAX_SEND_XNO": bad}
+            keys, node = keystore.KeyStore(), fakenode.FakeNode()
+            server = mcp_server.Server(profiles.FULL, env=env, node=node, keys=keys)
+            address = a_new_address(keys)
+            node.fund(address, 10 * RAW)
+            server.call_tool("receive", {"address": address})
+            published = len(node.published)
+            with self.subTest(limit=bad):
+                with self.assertRaises(payments.ToolError) as caught:
+                    server.call_tool("send", {"from": address, "to": BURN,
+                                              "amount_xno": "0.1",
+                                              "idempotency_key": "k-" + bad})
+                self.assertEqual(caught.exception.reason, "misconfigured_send_limit")
+                self.assertIn("NANO_WALLET_MAX_SEND_XNO", caught.exception.message)
+                self.assertEqual(len(node.published), published)  # nothing left the wallet
+
     def test_send_refuses_more_than_the_balance(self):
         env = {"NANO_WALLET_ALLOW_SEND": "1"}
         keys, node = keystore.KeyStore(), fakenode.FakeNode()
