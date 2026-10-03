@@ -45,7 +45,13 @@ class NanoNode:
 
     def account_info(self, address: str) -> dict:
         """`{"frontier","balance_raw","representative","block_count","confirmed"}`,
-        or `{}` for an account that has never been opened."""
+        or `{}` for an account that has never been opened.
+
+        An implementation that can tell whether `balance_raw` is the balance at
+        `frontier` - rather than at some earlier block on the same chain - also
+        returns `balance_is_frontier_balance`. A caller doing arithmetic with
+        the two together treats a missing key as True.
+        """
         raise NotImplementedError
 
     def receivable(self, address: str, count: int) -> list:
@@ -133,12 +139,30 @@ class HttpNanoNode(NanoNode):
         })
         if not answer.get("frontier"):
             return {}
+        confirmed_balance = answer.get("confirmed_balance")
         return {
             "frontier": answer["frontier"],
-            "balance_raw": int(answer.get("confirmed_balance", answer["balance"])),
+            "balance_raw": int(answer["balance"] if confirmed_balance is None
+                               else confirmed_balance),
             "representative": answer.get("confirmed_representative", answer.get("representative")),
             "block_count": int(answer.get("block_count", 0)),
             "confirmed": answer.get("confirmed_height") is not None,
+            # Does `balance_raw` belong to `frontier`? `frontier`/`balance`
+            # describe the account's tip; `confirmed_frontier`/`confirmed_balance`
+            # describe it at its confirmation height. They are the same point on
+            # the chain only while the tip is confirmed, and this answer takes the
+            # frontier from one and the balance from the other - so say which it
+            # is, because Nano reads a send's amount as the difference between
+            # two balances and `payments.send` pairs them. Reported here rather
+            # than repaired: which of the two a wallet should build on is a
+            # judgement about a chain it is extending, not about reading JSON
+            # (dhyabi2/nano-wallet-xno#4). Unprovable counts as False: a node
+            # that sends a confirmed balance and no confirmed frontier has not
+            # told us the two match.
+            "balance_is_frontier_balance": (
+                confirmed_balance is None
+                or answer.get("confirmed_frontier") == answer["frontier"]
+            ),
         }
 
     def receivable(self, address: str, count: int) -> list:
