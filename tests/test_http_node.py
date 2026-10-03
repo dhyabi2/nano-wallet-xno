@@ -68,6 +68,18 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         with self.assertRaises(nanonode.NodeError):
             node.process({"type": "state", "_subtype": "send"})
 
+    def test_process_tells_the_node_the_block_subtype(self):
+        # A receive built on a stale balance is rejected by the node rather than
+        # published, but only because the node is told which direction the block
+        # claims to go in and can check it against the balance change. That
+        # protection is what `payments.receive` relies on instead of a refusal
+        # of its own, so it is pinned here.
+        node, seen = self._node({"hash": "C" * 64})
+        node.process({"type": "state", "balance": "1", "_subtype": "receive"})
+        body = json.loads(seen[-1].data.decode("utf-8"))
+        self.assertEqual(body["subtype"], "receive")
+        self.assertNotIn("_subtype", body["block"])
+
     def test_every_call_names_itself(self):
         # Cloudflare-fronted public nodes answer urllib's default
         # User-Agent with 403 "error code: 1010", indistinguishable from
@@ -293,6 +305,137 @@ class ANewWalletReceivesAgainstAPublicNode(unittest.TestCase):
             payments.receive(address, node, keys)
         self.assertEqual(caught.exception.reason, "work_unavailable")
         self.assertEqual(self.published, [], "nothing may be published")
+
+
+class ASendIsNeverBuiltOnAMixedAccountState(unittest.TestCase):
+    """`account_info` took the frontier from the tip and the balance from the
+    confirmation height, and `payments.send` subtracts the one from the other.
+
+    `frontier`/`balance` describe the account's tip; `confirmed_frontier`/
+    `confirmed_balance` describe it at its confirmation height. Two different
+    points on the same chain, which differ for the second or two after the
+    wallet publishes a block of its own - the ordinary state for an agent that
+    was just paid and is paying on. Nano reads a send's amount as
+    `previous.balance - block.balance`, so the gap between the two moments left
+    the account on top of the payment: measured below, a 1 XNO send out of a
+    tip holding 6 XNO against a confirmed 5 moved 2 XNO.
+
+    Which of the two a send should be built on is a judgement about a chain the
+    wallet is extending and is open in #4. These tests pin the narrower claim:
+    while the two disagree, nothing is signed.
+    """
+
+    ONE = 10 ** 30
+    TIP = "B" * 64
+    CONFIRMED = "A" * 64
+    REP = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
+
+    def _answers(self, info):
+        self.published = []
+
+        def urlopen(request, timeout=None):
+            body = json.loads(request.data.decode("utf-8"))
+            action = body["action"]
+            if action == "account_info":
+                return _Answer(json.dumps(info).encode())
+            if action == "work_generate":
+                return _Answer(json.dumps({"work": "0" * 16}).encode())
+            if action == "process":
+                self.published.append(body["block"])
+                return _Answer(json.dumps({"hash": "C" * 64}).encode())
+            raise AssertionError("unexpected call: " + action)
+
+        patch = mock.patch.object(urllib.request, "urlopen", urlopen)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return nanonode.HttpNanoNode("https://node.example/rpc")
+
+    def _info(self, **over):
+        answer = {
+            "frontier": self.TIP, "balance": str(6 * self.ONE),
+            "confirmed_frontier": self.CONFIRMED,
+            "confirmed_balance": str(5 * self.ONE),
+            "representative": self.REP, "confirmed_representative": self.REP,
+            "block_count": "7", "confirmed_height": "6",
+        }
+        answer.update(over)
+        return answer
+
+    def _send(self, node):
+        keys = _keystore.KeyStore()
+        address = keys.put(bytes(range(1, 33)))
+        return payments.send(address, address, "1", "k1", node, keys, {},
+                             env={"NANO_WALLET_ALLOW_SEND": "1"})
+
+    # ---------------------------------------------------- what the node is asked
+
+    def test_a_balance_from_another_block_is_reported_as_such(self):
+        node = self._answers(self._info())
+        self.assertFalse(node.account_info("nano_x")["balance_is_frontier_balance"])
+
+    def test_a_settled_account_is_reported_as_settled(self):
+        node = self._answers(self._info(confirmed_frontier=self.TIP))
+        self.assertTrue(node.account_info("nano_x")["balance_is_frontier_balance"])
+
+    def test_a_node_that_sends_no_confirmed_balance_is_already_one_point(self):
+        # Then `balance_raw` is the tip's own balance, so the pair agrees.
+        answer = self._info()
+        del answer["confirmed_balance"]
+        del answer["confirmed_frontier"]
+        node = self._answers(answer)
+        info = node.account_info("nano_x")
+        self.assertTrue(info["balance_is_frontier_balance"])
+        self.assertEqual(info["balance_raw"], 6 * self.ONE)
+
+    def test_a_confirmed_balance_with_no_confirmed_frontier_is_not_proven(self):
+        # The node has not said the two match, so it fails closed rather than
+        # being given the benefit of the doubt on the send path.
+        answer = self._info()
+        del answer["confirmed_frontier"]
+        node = self._answers(answer)
+        self.assertFalse(node.account_info("nano_x")["balance_is_frontier_balance"])
+
+    # --------------------------------------------------------------- the money
+
+    def test_a_send_on_a_mixed_state_is_refused_and_nothing_is_signed(self):
+        node = self._answers(self._info())
+        with self.assertRaises(payments.ToolError) as caught:
+            self._send(node)
+        self.assertEqual(caught.exception.reason, "account_state_unsettled")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.published, [], "nothing may be published")
+
+    def test_without_the_refusal_that_send_moves_twice_what_was_asked(self):
+        # The defect itself, held in one place: build the same block from the
+        # same answer with the guard's input flipped, and read the amount the
+        # way Nano reads it.
+        node = self._answers(self._info())
+        real = node.account_info
+
+        def mixed_but_unflagged(address):
+            info = real(address)
+            info["balance_is_frontier_balance"] = True
+            return info
+
+        node.account_info = mixed_but_unflagged
+        self._send(node)
+        self.assertEqual(len(self.published), 1)
+        block = self.published[0]
+        self.assertEqual(block["previous"], self.TIP)
+        moved = 6 * self.ONE - int(block["balance"])
+        self.assertEqual(
+            moved, 2 * self.ONE,
+            "a send of 1 XNO off this answer moves %d raw" % moved)
+
+    def test_a_settled_account_still_sends_exactly_what_was_asked(self):
+        node = self._answers(self._info(confirmed_frontier=self.TIP,
+                                        confirmed_balance=str(6 * self.ONE)))
+        result = self._send(node)
+        self.assertEqual(result["amount_xno"], "1.000000")
+        self.assertEqual(len(self.published), 1)
+        block = self.published[0]
+        self.assertEqual(block["previous"], self.TIP)
+        self.assertEqual(6 * self.ONE - int(block["balance"]), self.ONE)
 
 
 if __name__ == "__main__":
