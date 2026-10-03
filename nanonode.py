@@ -16,6 +16,8 @@ import json
 import urllib.error
 import urllib.request
 
+import work as _work
+
 DEFAULT_TIMEOUT = 10.0
 
 # Sent on every call. Cloudflare-fronted public nodes answer urllib's default
@@ -50,7 +52,9 @@ class NanoNode:
         """`[{"hash","amount_raw","source"}]`, newest first, at most `count`."""
         raise NotImplementedError
 
-    def work_generate(self, root_hex: str) -> str:
+    def work_generate(self, root_hex: str, subtype: str = None) -> str:
+        """Work for `root_hex`. `subtype` says which threshold the block needs;
+        an implementation may use it to decide whether it can find work itself."""
         raise NotImplementedError
 
     def process(self, block: dict) -> str:
@@ -76,13 +80,17 @@ def host_of(url: str) -> str:
 class HttpNanoNode(NanoNode):
     """A Nano node's JSON-RPC endpoint, over urllib. No dependencies."""
 
-    def __init__(self, url: str, timeout: float = DEFAULT_TIMEOUT, auth_header: str = None):
+    def __init__(self, url: str, timeout: float = DEFAULT_TIMEOUT, auth_header: str = None,
+                 local_work: bool = True):
         if not url:
             raise NodeError("node_not_configured",
                             "no node URL: set NANO_NODE_URL to a Nano RPC endpoint")
         self.url = url
         self.timeout = timeout
         self.auth_header = auth_header
+        # Public nodes refuse `work_generate`, and a new wallet has no other
+        # node. Set False to require the node to supply work.
+        self.local_work = local_work
 
     def _rpc(self, payload: dict) -> dict:
         body = json.dumps(payload).encode("utf-8")
@@ -151,14 +159,52 @@ class HttpNanoNode(NanoNode):
                 out.append({"hash": block_hash, "amount_raw": int(info), "source": None})
         return out[:count]
 
-    def work_generate(self, root_hex: str) -> str:
-        answer = self._rpc({"action": "work_generate", "hash": root_hex})
-        work = answer.get("work")
-        if not work:
+    def work_generate(self, root_hex: str, subtype: str = None) -> str:
+        """Ask the node, and fall back to local work for a receive or an open.
+
+        A public node answers `work_generate` with an error or with nothing,
+        and that is the only node a brand-new wallet has - it owns no XNO yet,
+        so its first operation is a receive. Nano asks 64x less work of a
+        receive or open block than of a send, and that much is findable here
+        in seconds, so the node refusing is no longer the end of the road.
+
+        It stays a fallback, not a replacement: a node that generates work is
+        asked first and is faster. Nothing that spends falls back (see
+        `work.LOCAL_SUBTYPES`) - at the send threshold this would take minutes,
+        and a send whose node owes it work should say so, not stall.
+        """
+        try:
+            answer = self._rpc({"action": "work_generate", "hash": root_hex})
+            work = answer.get("work")
+        except NodeError as exc:
+            # The node answered and refused (work generation disabled, no work
+            # peer). Unreachable is different: the block could not be published
+            # either, so the caller needs that error, not a minute of hashing.
+            if exc.reason != "node_error":
+                raise
+            work = None
+        if work:
+            return work
+        return self._local_work(root_hex, subtype)
+
+    def _local_work(self, root_hex: str, subtype: str = None) -> str:
+        refused = NodeError(
+            "work_unavailable",
+            "the node at %s did not return proof-of-work; enable work generation "
+            "on it or set a work peer" % host_of(self.url))
+        if not self.local_work or subtype not in _work.LOCAL_SUBTYPES:
+            raise refused
+        try:
+            root = bytes.fromhex(root_hex)
+        except ValueError:
+            raise NodeError("bad_work_root",
+                            "work root must be 64 hex characters") from None
+        try:
+            return _work.solve(root, _work.RECEIVE_THRESHOLD)
+        except (_work.WorkUnavailable, ValueError) as exc:
             raise NodeError("work_unavailable",
-                            "the node at %s did not return proof-of-work; enable "
-                            "work generation on it or set a work peer" % host_of(self.url))
-        return work
+                            "the node at %s did not return proof-of-work and none was "
+                            "found here: %s" % (host_of(self.url), exc)) from None
 
     def process(self, block: dict) -> str:
         answer = self._rpc({

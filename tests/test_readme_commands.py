@@ -62,3 +62,37 @@ class ReadmeCommands(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThePackageShipsEveryModuleItImports(unittest.TestCase):
+    """`py-modules` is an explicit list, so a new module is invisible to it.
+
+    The suite runs from the source tree, where every sibling `.py` imports
+    whether or not it is packaged. A module left out of `py-modules` is
+    therefore absent only from the built wheel - the installed command dies
+    with `ModuleNotFoundError` on an import the source tree resolves fine, and
+    nothing in a green suite can see it. `work` was one import away from
+    shipping that way.
+    """
+
+    def _py_modules(self):
+        text = open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8").read()
+        block = text.split("py-modules", 1)[1].split("[", 1)[1].split("]", 1)[0]
+        return set(re.findall(r'"([^"]+)"', block))
+
+    def test_every_local_module_imported_by_the_package_is_packaged(self):
+        packaged = self._py_modules()
+        local = {f[:-3] for f in os.listdir(ROOT) if f.endswith(".py")}
+        # Modules that are deliberately not shipped: the end-to-end drivers and
+        # the package's own entry-point shim.
+        not_shipped = {"e2e_check", "e2e_receive_only", "__main__"}
+        for name in sorted(packaged):
+            source = os.path.join(ROOT, name + ".py")
+            text = open(source, encoding="utf-8").read()
+            imported = set(re.findall(r"^\s*(?:import|from)\s+([A-Za-z_][\w]*)",
+                                      text, re.M))
+            for dep in sorted(imported & local - not_shipped):
+                self.assertIn(
+                    dep, packaged,
+                    "%s.py imports %r, which pyproject.toml's py-modules leaves "
+                    "out - the wheel would install %s without it" % (name, dep, name))

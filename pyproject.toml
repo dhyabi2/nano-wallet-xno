@@ -19,4 +19,4 @@ mandate = "mandate:main"
 py-modules = ["nanoaddr", "ed25519_blake2b", "wallet", "cli", "mcp_server",
               "profiles", "capabilities", "selfcheck", "payments", "blocks",
               "keystore", "nanonode", "fakenode", "wellknown",
-              "mandate"]
+              "mandate", "work"]
