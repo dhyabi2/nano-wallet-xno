@@ -113,12 +113,38 @@ class HttpNanoNode(NanoNode):
         })
         if not answer.get("frontier"):
             return {}
+        # `frontier` and `balance` are the account's TIP. `confirmed_frontier`
+        # and `confirmed_balance` are the account at its confirmation height.
+        # They differ whenever a block of ours has not been confirmed yet -
+        # for the second or two after we publish a receive, say.
+        #
+        # They must be read as a PAIR. This returned the tip's frontier beside
+        # the CONFIRMED balance, and `blocks.build_signed` uses the frontier as
+        # `previous` and the balance to compute the new one. Nano reads the
+        # amount of a send as `previous.balance - block.balance`, so the
+        # mismatch is paid out of the account: receive 1 XNO, then send 1 XNO
+        # before that receive confirms, and previous.balance is 6 XNO while the
+        # block says 5 - 1 = 4, so 2 XNO leaves. The agent asked to send 1.
+        #
+        # The tip is the pair to use. `previous` has to BE the account's tip or
+        # the block forks our own chain, and the unconfirmed part of the tip is
+        # our own just-published blocks: `receivable` below asks for
+        # `include_only_confirmed`, so we only ever receive sends the network
+        # has already confirmed. `confirmed` now says whether the tip itself is
+        # confirmed, which is the question a caller was asking all along - it
+        # used to be `confirmed_height is not None`, true for every opened
+        # account, including this one.
+        frontier = answer["frontier"]
+        confirmed_frontier = answer.get("confirmed_frontier") or \
+            answer.get("confirmation_height_frontier")
         return {
-            "frontier": answer["frontier"],
-            "balance_raw": int(answer.get("confirmed_balance", answer["balance"])),
-            "representative": answer.get("confirmed_representative", answer.get("representative")),
+            "frontier": frontier,
+            "balance_raw": int(answer["balance"]),
+            "representative": answer.get("representative"),
             "block_count": int(answer.get("block_count", 0)),
-            "confirmed": answer.get("confirmed_height") is not None,
+            # A node that reports no confirmed frontier cannot tell us; that is
+            # the answer this returned before, kept rather than guessed at.
+            "confirmed": confirmed_frontier == frontier if confirmed_frontier else True,
         }
 
     def receivable(self, address: str, count: int) -> list:

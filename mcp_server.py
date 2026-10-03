@@ -70,7 +70,11 @@ TOOL_DEFINITIONS = {
     },
     "balance": {
         "name": "balance",
-        "description": "Read an account's confirmed balance and what is waiting to be pocketed.",
+        "description": (
+            "Read an account's balance and what is waiting to be pocketed. The balance is "
+            "the account's latest block; `confirmed` says whether the network has confirmed "
+            "that block yet."
+        ),
         "inputSchema": {"type": "object", "properties": {"address": _ADDRESS_ARG},
                         "required": ["address"]},
     },
