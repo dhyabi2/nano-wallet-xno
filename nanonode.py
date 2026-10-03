@@ -18,6 +18,10 @@ import urllib.request
 
 DEFAULT_TIMEOUT = 10.0
 
+# Sent on every call. Cloudflare-fronted public nodes answer urllib's default
+# User-Agent with 403 "error code: 1010", which reads exactly like a refused key.
+USER_AGENT = "nano-wallet-xno/1.1"
+
 
 class NodeError(Exception):
     """A node was unreachable, or answered something unusable.
@@ -83,7 +87,8 @@ class HttpNanoNode(NanoNode):
     def _rpc(self, payload: dict) -> dict:
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
-            self.url, data=body, headers={"Content-Type": "application/json"}
+            self.url, data=body,
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         )
         if self.auth_header:
             request.add_header("Authorization", self.auth_header)
@@ -102,6 +107,13 @@ class HttpNanoNode(NanoNode):
                 % (host_of(self.url), exc),
             ) from None
         if isinstance(answer, dict) and "error" in answer:
+            # A real node answers `account_info` for an account that has never
+            # received with this error, not with an empty account. It is the
+            # state every new wallet starts in, so it is an empty answer here
+            # (`account_info` turns a missing frontier into `{}`), and only for
+            # that one call - anywhere else it is still a node error.
+            if payload.get("action") == "account_info" and answer["error"] == "Account not found":
+                return {}
             raise NodeError("node_error", "the Nano node at %s returned: %s"
                             % (host_of(self.url), answer["error"]))
         return answer
