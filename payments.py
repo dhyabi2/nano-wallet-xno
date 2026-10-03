@@ -186,7 +186,8 @@ def receive(address: str, node: nanonode.NanoNode, keys: _keystore.KeyStore,
                 bytes.fromhex(block["hash"]),
                 "receive" if previous != blocks.ZERO32 else "open",
             )
-            signed["work"] = node.work_generate(signed.pop("_work_root"))
+            signed["work"] = node.work_generate(signed.pop("_work_root"),
+                                               signed["_subtype"])
             block_hash = signed.pop("_hash")
             node.process(dict(signed))
             previous = bytes.fromhex(block_hash)
@@ -304,7 +305,8 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
         rep_pk = _representative_pk(representative, info.get("representative"), source_pk)
         signed = blocks.build_signed(private_key, source_pk, previous, rep_pk,
                                      balance_raw - amount_raw, destination_pk, "send")
-        signed["work"] = node.work_generate(signed.pop("_work_root"))
+        signed["work"] = node.work_generate(signed.pop("_work_root"),
+                                               signed["_subtype"])
         block_hash = signed.pop("_hash")
         if guard is None:
             node.process(dict(signed))

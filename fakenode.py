@@ -52,7 +52,7 @@ class FakeNode(nanonode.NanoNode):
         self._guard("receivable")
         return [dict(block) for block in self.pending.get(address, [])[:count]]
 
-    def work_generate(self, root_hex: str) -> str:
+    def work_generate(self, root_hex: str, subtype: str = None) -> str:
         self._guard("work_generate")
         if len(root_hex) != 64:
             raise nanonode.NodeError("bad_work_root",

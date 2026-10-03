@@ -125,6 +125,32 @@ proof   = wallet.sign_message(b"challenge", account["private_key"])
 integers only — a sub-cent per-call price does not round to zero and does not
 drift under summation. No float appears in the money path.
 
+## Receiving against a public node
+
+A new wallet owns nothing, so its first operation is a receive, and the only
+node it has is a public one. Public nodes refuse `work_generate`. Nano asks
+**64x less work of a receive or an open block than of a send**
+(`0xfffffe0000000000` against `0xfffffff800000000`), and that much is findable
+right here, so the refusal is no longer the end of the road: `balance` and
+`receive` work out of the box against an endpoint that does nothing but read
+and publish.
+
+* The node is still asked first — one that generates work is faster.
+* Local work is found **only for a receive or an open block**. Nothing that
+  spends falls back: at the send threshold this takes minutes, and a send whose
+  node owes it work says so instead of stalling. Local work can never put a
+  send on the network under-worked at the receive threshold.
+* Measured here at about 1.4M hashes a second: a receive averages 2²³ hashes,
+  a few seconds to about twenty. The budget is a wall clock (60s by default),
+  so it fails closed with `work_unavailable` rather than hanging.
+* Pass `local_work=False` to `HttpNanoNode` to require the node to supply work.
+
+The validator is pinned in `tests/test_work.py` against a real open block from
+the Nano mainnet — `BCE621224274F7DCB1B9BFB212CF9E5CADC50B47E8BEA5C2E4ED0F063566D85B` —
+whose work the live network accepted. Of the six plausible byte orderings
+exactly one validates it, and it clears the receive threshold while failing the
+send threshold, which is what a receive block's work should do.
+
 ## The receive-only profile
 
 An operator who will not approve spend authority is not being difficult. They
@@ -242,7 +268,7 @@ of any mandate.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 106 tests — OK
+Ran 134 tests — OK
 
 $ python3 e2e_check.py
 15/15 checks passed

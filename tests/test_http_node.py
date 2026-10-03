@@ -14,12 +14,17 @@ import json
 import os
 import sys
 import unittest
+import urllib.error
 import urllib.request
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import keystore as _keystore  # noqa: E402
+import nanoaddr as _nanoaddr  # noqa: E402
 import nanonode  # noqa: E402
+import payments  # noqa: E402
+import work  # noqa: E402
 
 NEW = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
 
@@ -71,6 +76,223 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         node.account_info(NEW)
         agent = seen[0].get_header("User-agent") or ""
         self.assertTrue(agent.startswith("nano-wallet-xno/"), agent)
+
+
+
+class WorkWhenTheNodeWillNotDoIt(unittest.TestCase):
+    """A public node refuses `work_generate`. That used to end a receive."""
+
+    def _node(self, answer, **kw):
+        patch = mock.patch.object(urllib.request, "urlopen", _node_answering(answer, []))
+        patch.start()
+        self.addCleanup(patch.stop)
+        return nanonode.HttpNanoNode("https://node.example/rpc", **kw)
+
+    def _spy_on_solve(self):
+        """Record what the node asks of `work.solve` and answer cheaply.
+
+        The search itself is tested in `test_work.py`; what matters here is
+        which threshold is asked for and whether it is asked for at all.
+        """
+        calls = []
+
+        def solve(root, threshold=None, budget_seconds=None, _now=None):
+            calls.append({"root": root, "threshold": threshold})
+            return "0123456789abcdef"
+        patch = mock.patch.object(nanonode._work, "solve", solve)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return calls
+
+    def test_a_refused_receive_falls_back_to_local_work(self):
+        calls = self._spy_on_solve()
+        node = self._node({"error": "Work generation is disabled"})
+        self.assertEqual(node.work_generate("AB" * 32, "receive"), "0123456789abcdef")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["root"], bytes.fromhex("AB" * 32))
+
+    def test_an_open_block_falls_back_too(self):
+        self._spy_on_solve()
+        node = self._node({"error": "Work generation is disabled"})
+        self.assertEqual(node.work_generate("AB" * 32, "open"), "0123456789abcdef")
+
+    def test_it_asks_only_for_the_receive_threshold(self):
+        calls = self._spy_on_solve()
+        node = self._node({"error": "Work generation is disabled"})
+        node.work_generate("AB" * 32, "receive")
+        self.assertEqual(calls[0]["threshold"], work.RECEIVE_THRESHOLD)
+        self.assertLess(calls[0]["threshold"], work.SEND_THRESHOLD)
+
+    def test_a_send_is_never_given_local_work(self):
+        # At the send threshold this would take minutes. A send whose node
+        # owes it work has to say so, not stall - and must never go out
+        # under-worked at the receive threshold.
+        calls = self._spy_on_solve()
+        node = self._node({"error": "Work generation is disabled"})
+        with self.assertRaises(nanonode.NodeError) as caught:
+            node.work_generate("AB" * 32, "send")
+        self.assertEqual(caught.exception.reason, "work_unavailable")
+        self.assertEqual(calls, [])
+
+    def test_an_unknown_subtype_is_not_given_local_work(self):
+        calls = self._spy_on_solve()
+        node = self._node({"error": "Work generation is disabled"})
+        for subtype in (None, "", "change", "epoch"):
+            with self.assertRaises(nanonode.NodeError):
+                node.work_generate("AB" * 32, subtype)
+        self.assertEqual(calls, [])
+
+    def test_local_work_can_be_turned_off(self):
+        calls = self._spy_on_solve()
+        node = self._node({"error": "Work generation is disabled"}, local_work=False)
+        with self.assertRaises(nanonode.NodeError) as caught:
+            node.work_generate("AB" * 32, "receive")
+        self.assertEqual(caught.exception.reason, "work_unavailable")
+        self.assertEqual(calls, [])
+
+    def test_a_node_that_does_the_work_is_still_preferred(self):
+        calls = self._spy_on_solve()
+        node = self._node({"work": "fedcba9876543210"})
+        self.assertEqual(node.work_generate("AB" * 32, "receive"), "fedcba9876543210")
+        self.assertEqual(calls, [], "the node answered; local work should not run")
+
+    def test_a_node_answering_no_work_at_all_falls_back(self):
+        self._spy_on_solve()
+        node = self._node({"work": ""})
+        self.assertEqual(node.work_generate("AB" * 32, "receive"), "0123456789abcdef")
+
+    def test_an_unreachable_node_is_not_answered_with_a_minute_of_hashing(self):
+        # The block could not be published either, so the caller needs the
+        # real error rather than work it cannot use.
+        calls = self._spy_on_solve()
+
+        def refuse(request, timeout=None):
+            raise urllib.error.URLError("no route to host")
+        patch = mock.patch.object(urllib.request, "urlopen", refuse)
+        patch.start()
+        self.addCleanup(patch.stop)
+        node = nanonode.HttpNanoNode("https://node.example/rpc")
+        with self.assertRaises(nanonode.NodeError) as caught:
+            node.work_generate("AB" * 32, "receive")
+        self.assertEqual(caught.exception.reason, "node_unreachable")
+        self.assertEqual(calls, [])
+
+    def test_a_failed_local_search_still_fails_closed(self):
+        def give_up(root, threshold=None, budget_seconds=None, _now=None):
+            raise work.WorkUnavailable("nothing found")
+        patch = mock.patch.object(nanonode._work, "solve", give_up)
+        patch.start()
+        self.addCleanup(patch.stop)
+        node = self._node({"error": "Work generation is disabled"})
+        with self.assertRaises(nanonode.NodeError) as caught:
+            node.work_generate("AB" * 32, "receive")
+        self.assertEqual(caught.exception.reason, "work_unavailable")
+
+    def test_a_bad_root_is_named_rather_than_hashed(self):
+        self._spy_on_solve()
+        node = self._node({"error": "Work generation is disabled"})
+        with self.assertRaises(nanonode.NodeError) as caught:
+            node.work_generate("nothex" * 10, "receive")
+        self.assertEqual(caught.exception.reason, "bad_work_root")
+
+
+
+def _at_an_easy_threshold(threshold):
+    """`work.solve` pinned to an easier threshold, for a test that must be fast.
+
+    `nanonode._work` IS the `work` module, so the real function has to be
+    bound before the patch replaces it - otherwise the replacement calls
+    itself.
+    """
+    real_solve = work.solve
+
+    def solve(root, _threshold=None, budget_seconds=None, _now=None):
+        return real_solve(root, threshold)
+    return solve
+
+
+class ANewWalletReceivesAgainstAPublicNode(unittest.TestCase):
+    """The whole of issue #6, end to end, against one fake public node.
+
+    The node answers the way rpc.nano.to does: `Account not found` for an
+    account that has never received, and a refusal for `work_generate`.
+    Before the two fixes this pair was fatal twice over. The work here is
+    found by the real search, at an easier threshold so the test costs
+    milliseconds - `test_work.py` pins the real threshold against a block
+    the network accepted.
+    """
+
+    SOURCE = "B" * 64
+    AMOUNT = "250000000000000000000000000000"
+    EASY = 0x8000000000000000
+
+    def setUp(self):
+        self.published = []
+        self.drained = False
+
+        def urlopen(request, timeout=None):
+            body = json.loads(request.data.decode("utf-8"))
+            action = body["action"]
+            if action == "account_info":
+                return _Answer(json.dumps({"error": "Account not found"}).encode())
+            if action == "receivable":
+                if self.drained:
+                    return _Answer(json.dumps({"blocks": {}}).encode())
+                self.drained = True
+                return _Answer(json.dumps(
+                    {"blocks": {self.SOURCE: self.AMOUNT}}).encode())
+            if action == "work_generate":
+                return _Answer(json.dumps(
+                    {"error": "Work generation is disabled"}).encode())
+            if action == "process":
+                self.published.append(body["block"])
+                return _Answer(json.dumps({"hash": "C" * 64}).encode())
+            raise AssertionError("unexpected call: " + action)
+
+        for target, attr, value in (
+            (urllib.request, "urlopen", urlopen),
+            (nanonode._work, "solve", _at_an_easy_threshold(self.EASY)),
+        ):
+            patch = mock.patch.object(target, attr, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_it_opens_its_account_and_the_work_is_valid(self):
+        keys = _keystore.KeyStore()
+        address = keys.put(bytes(range(1, 33)))
+        node = nanonode.HttpNanoNode("https://node.example/rpc")
+
+        result = payments.receive(address, node, keys)
+
+        self.assertEqual(len(result["received"]), 1)
+        self.assertEqual(result["balance_xno"], "0.250000")
+        self.assertEqual(result["remaining_pending"], 0)
+
+        self.assertEqual(len(self.published), 1)
+        block = self.published[0]
+        # An open block: no previous, and the link is the send it receives.
+        self.assertEqual(block["previous"], "0" * 64)
+        self.assertEqual(block["link"].upper(), self.SOURCE)
+        self.assertEqual(block["balance"], self.AMOUNT)
+        # The work is real work for this block's own root, which for an open
+        # block is the account's public key.
+        root = bytes.fromhex(_nanoaddr.decode(address).hex())
+        self.assertTrue(work.validates(root, block["work"], self.EASY),
+                        "the published block carries work that does not validate")
+        self.assertEqual(len(block["work"]), 16)
+        # No negative assertion here: at a lowered threshold half of all
+        # (root, work) pairs validate by chance, so "it is not valid for
+        # another root" would be a coin flip. That binding is pinned in
+        # test_work.py, against the real threshold and a real block.
+
+    def test_without_local_work_the_receive_still_fails_closed(self):
+        keys = _keystore.KeyStore()
+        address = keys.put(bytes(range(1, 33)))
+        node = nanonode.HttpNanoNode("https://node.example/rpc", local_work=False)
+        with self.assertRaises(payments.ToolError) as caught:
+            payments.receive(address, node, keys)
+        self.assertEqual(caught.exception.reason, "work_unavailable")
+        self.assertEqual(self.published, [], "nothing may be published")
 
 
 if __name__ == "__main__":
