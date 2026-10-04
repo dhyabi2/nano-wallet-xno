@@ -287,6 +287,26 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
                 % (idempotency_key, _six(previous_call["amount_raw"]), previous_call["to"]),
                 409,
             )
+        if previous_call.get("result") is None:
+            # A block was signed and handed to the node under this key, and the
+            # node's reply never arrived. The reply is what is missing, not the
+            # block: Nano has no fee and no reversal, so a broadcast whose
+            # outcome is unknown may well have landed. Replaying it would
+            # rebuild from the NEW frontier and pay the destination a second
+            # time - the exact thing the key is here to stop. Refuse, and name
+            # the block so it can be looked up.
+            raise ToolError(
+                "send_outcome_unknown",
+                "idempotency_key %r already broadcast a send of %s XNO to %s as block %s, "
+                "and the node's reply did not arrive, so it is not known whether it "
+                "landed. Nothing was signed now. Look that block up on the ledger: if it "
+                "is there the payment is made; if it is not, retry with a NEW "
+                "idempotency_key. Repeating this one would build a second send from the "
+                "account's new frontier and pay twice."
+                % (idempotency_key, _six(previous_call["amount_raw"]), previous_call["to"],
+                   previous_call.get("block_hash") or "(unknown)"),
+                409,
+            )
         return dict(previous_call["result"], replayed=True)
 
     guard = _mandate_guard(env, source)  # after the replay: a replay sends nothing
@@ -342,6 +362,14 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
         signed["work"] = node.work_generate(signed.pop("_work_root"),
                                                signed["_subtype"])
         block_hash = signed.pop("_hash")
+        # Record the attempt BEFORE the broadcast, the way mandate.py's ledger
+        # reserves before it spends and for the same reason it gives there: a
+        # send whose outcome is unknown has to stay counted, because
+        # under-counting is how the same payment goes out twice. Until the
+        # node's reply arrives this entry carries no result, which is what
+        # makes the replay above a refusal rather than a second send.
+        sent[str(idempotency_key)] = {"to": destination, "amount_raw": amount_raw,
+                                      "result": None, "block_hash": block_hash}
         if guard is None:
             node.process(dict(signed))
         else:
@@ -362,7 +390,7 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
         "receipt": "https://nanolooker.com/block/%s" % block_hash,
     }
     sent[str(idempotency_key)] = {"to": destination, "amount_raw": amount_raw,
-                                  "result": result}
+                                  "result": result, "block_hash": block_hash}
     return dict(result)
 
 
