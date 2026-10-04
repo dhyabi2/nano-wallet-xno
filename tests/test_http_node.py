@@ -189,6 +189,40 @@ class WorkWhenTheNodeWillNotDoIt(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "node_unreachable")
         self.assertEqual(calls, [])
 
+    def _node_refusing_with_http(self, status):
+        def refuse(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, status, "Payment Required"
+                                         if status == 402 else "refused", {}, io.BytesIO(b"{}"))
+        patch = mock.patch.object(urllib.request, "urlopen", refuse)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return nanonode.HttpNanoNode("https://user:key@node.example/rpc")
+
+    def test_a_node_refusing_with_http_402_falls_back_to_local_work(self):
+        # rpc.nano.to - the node bounties.txt sends a new agent to - answers
+        # `work_generate` with HTTP 402. The node was reached and said no, so
+        # this is the refusal the fallback exists for, not an outage.
+        calls = self._spy_on_solve()
+        node = self._node_refusing_with_http(402)
+        self.assertEqual(node.work_generate("AB" * 32, "receive"), "0123456789abcdef")
+        self.assertEqual(len(calls), 1)
+
+    def test_an_http_4xx_is_a_node_error_naming_the_status_not_the_credentials(self):
+        node = self._node_refusing_with_http(402)
+        with self.assertRaises(nanonode.NodeError) as caught:
+            node.account_info(NEW)
+        self.assertEqual(caught.exception.reason, "node_error")
+        self.assertIn("402", str(caught.exception))
+        self.assertNotIn("key", str(caught.exception))
+
+    def test_an_http_5xx_is_still_unreachable_and_not_hashed_for(self):
+        calls = self._spy_on_solve()
+        node = self._node_refusing_with_http(503)
+        with self.assertRaises(nanonode.NodeError) as caught:
+            node.work_generate("AB" * 32, "receive")
+        self.assertEqual(caught.exception.reason, "node_unreachable")
+        self.assertEqual(calls, [])
+
     def test_a_failed_local_search_still_fails_closed(self):
         def give_up(root, threshold=None, budget_seconds=None, _now=None):
             raise work.WorkUnavailable("nothing found")

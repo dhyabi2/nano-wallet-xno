@@ -109,6 +109,22 @@ class HttpNanoNode(NanoNode):
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 answer = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # A 4xx came from the node itself: it was reached and refused
+            # (rpc.nano.to answers `work_generate` with 402). That is a node
+            # answer, so `work_generate` may still fall back to local work.
+            # A 5xx is a node, or the proxy in front of it, that is down.
+            if 400 <= exc.code < 500:
+                raise NodeError(
+                    "node_error",
+                    "the Nano node at %s refused with HTTP %d %s"
+                    % (host_of(self.url), exc.code, exc.reason),
+                ) from None
+            raise NodeError(
+                "node_unreachable",
+                "could not reach the Nano node at %s: HTTP %d %s"
+                % (host_of(self.url), exc.code, exc.reason),
+            ) from None
         except urllib.error.URLError as exc:
             raise NodeError(
                 "node_unreachable",
