@@ -109,6 +109,31 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         self.assertEqual(body["subtype"], "receive")
         self.assertNotIn("_subtype", body["block"])
 
+    def test_a_block_the_node_rejects_as_invalid_is_a_rejection(self):
+        # The node read the block and said it can never be valid: not a lost
+        # reply, so the wallet may build a new one instead of holding this one.
+        for error in ("Block work is less than threshold", "Bad signature",
+                      "Balance and amount delta do not match", "Negative spend",
+                      "Block is invalid"):
+            node, _ = self._node({"error": error})
+            with self.assertRaises(nanonode.NodeError) as caught:
+                node.process({"type": "state", "_subtype": "send"})
+            self.assertEqual(caught.exception.reason, "block_rejected", error)
+            self.assertIn(error, caught.exception.message)
+
+    def test_an_answer_that_says_nothing_about_the_block_itself_is_not_a_rejection(self):
+        # "Old block" means it IS on the ledger; "Fork" means it is in an
+        # election it may still win; a gap means the node may apply it once the
+        # block before it arrives; the RPC's subtype checks read the account's
+        # CURRENT balance, so a block that landed earlier fails them once the
+        # account has moved on; anything unrecognised is not a verdict.
+        for error in ("Old block", "Fork", "Gap previous block", "Gap source block",
+                      "Invalid block balance for given subtype", "Something new"):
+            node, _ = self._node({"error": error})
+            with self.assertRaises(nanonode.NodeError) as caught:
+                node.process({"type": "state", "_subtype": "send"})
+            self.assertEqual(caught.exception.reason, "node_error", error)
+
     def test_every_call_names_itself(self):
         # Cloudflare-fronted public nodes answer urllib's default
         # User-Agent with 403 "error code: 1010", indistinguishable from

@@ -40,6 +40,39 @@ class NodeError(Exception):
         self.message = message
 
 
+# Answers to `process` that say the block itself is invalid - fixed by its own
+# bytes and the block it names as `previous` - so it can never land, here or on
+# any other node. Matched case-insensitively as substrings of the node's error.
+# Deliberately NOT here, because each leaves the block able to land: "Old block"
+# (it is already on the ledger), "Fork" (it is in an election it may still win),
+# "Gap ..." (the node may apply it once the block before it arrives), and the
+# RPC's subtype checks ("Invalid block balance for given subtype", ...), which
+# compare against the account's CURRENT balance, so a block that landed earlier
+# fails them once the account has moved on. Anything unrecognised is not a
+# verdict either.
+# `process` raises these as NodeError("block_rejected"), the one NodeError that is
+# a verdict on the block rather than on the connection.
+_REJECTIONS = (
+    "bad signature",
+    "work is less than threshold",
+    "insufficient work",
+    "negative spend",
+    "balance and amount delta do not match",
+    "balance mismatch",
+    "cannot follow the previous block",
+    "block is invalid",
+)
+_NOT_REJECTIONS = ("old block", "fork", "gap", "subtype")
+
+
+def is_rejection(error) -> bool:
+    """True when a node's `process` error says the block can never be valid."""
+    text = str(error or "").lower()
+    if any(marker in text for marker in _NOT_REJECTIONS):
+        return False
+    return any(marker in text for marker in _REJECTIONS)
+
+
 class NanoNode:
     """The RPC surface this wallet needs. Six calls, no more."""
 
@@ -155,6 +188,9 @@ class HttpNanoNode(NanoNode):
             # answer ("not here"), not a failure to reach the node.
             if payload.get("action") == "block_info" and answer["error"] == "Block not found":
                 return {}
+            if payload.get("action") == "process" and is_rejection(answer["error"]):
+                raise NodeError("block_rejected", "the Nano node at %s rejected the block: %s"
+                                % (host_of(self.url), answer["error"]))
             raise NodeError("node_error", "the Nano node at %s returned: %s"
                             % (host_of(self.url), answer["error"]))
         return answer

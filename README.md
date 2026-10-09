@@ -268,7 +268,7 @@ of any mandate.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 180 tests — OK
+Ran 192 tests — OK
 
 $ python3 e2e_check.py
 15/15 checks passed
@@ -321,9 +321,14 @@ settles it from the ledger and never builds a second send: the block it signed
 is on the ledger (`reconciled: "landed"`); it is not, but the account has not
 moved since, so that same signed block is published again - one hash, at most
 one payment (`reconciled: "rebroadcast"`); or a different block was built where
-it would have gone, so it can never land and nothing was paid (`send_did_not_land`,
-409 - retry under a new key). If the node cannot be asked, or cannot show which
-block was built there, the answer stays `send_outcome_unknown` (409); do not
+it would have gone and is confirmed, so it can never land and nothing was paid
+(`send_did_not_land`, 409 - retry under a new key). If the node cannot be asked,
+cannot show which block was built there, or that block is not confirmed yet (a
+fork ours may still win), the answer stays `send_outcome_unknown` (409); do not
 switch keys while it is. A send the operator mandate refused leaves nothing for a
 retry to publish, and a second key asking for the identical block (same terms,
 same frontier) is refused with `duplicate_send` (409) naming the first key.
+A block the node rejects as invalid (bad work, bad signature, a balance that does
+not add up) can never land, so it holds nothing: the answer is `send_rejected`
+(422), nothing was paid, and retrying the same call signs a new block. Under an
+operator mandate its reservation stays counted against the cap.

@@ -53,6 +53,7 @@ class FlakyNode(fakenode.FakeNode):
         self.lookups_fail = False
         self.forget = set()          # hashes this node answers "not found" for
         self.no_successor = False    # a node that does not report `successor`
+        self.unconfirmed = set()     # hashes this node reports as not yet confirmed
 
     def process(self, block):
         if self.mode == "drop":
@@ -73,6 +74,8 @@ class FlakyNode(fakenode.FakeNode):
         found = super().block_info(block_hash)
         if self.no_successor:
             found.pop("successor", None)
+        if found and block_hash in self.unconfirmed:
+            found["confirmed"] = False
         return found
 
 
@@ -275,6 +278,180 @@ class AnUnknownSendIsSettledFromTheLedger(unittest.TestCase):
         self.assertEqual(len(self.sends_applied()), 1)
 
 
+class AnUnconfirmedOccupantIsNotAVerdict(unittest.TestCase):
+    """`send_did_not_land` tells the agent to pay again under a new key.
+
+    The block that took the slot is only the winner once it is confirmed.
+    While it is not, the two blocks on one `previous` are a fork the network
+    has not decided, and ours can still win it - so telling the agent "it did
+    not land" then is how the same payment goes out twice. Until the
+    occupant is confirmed the outcome stays unknown.
+    """
+
+    setUp = AnUnknownSendIsSettledFromTheLedger.setUp
+    send = AnUnknownSendIsSettledFromTheLedger.send
+    first_attempt_fails = AnUnknownSendIsSettledFromTheLedger.first_attempt_fails
+    sends_applied = AnUnknownSendIsSettledFromTheLedger.sends_applied
+
+    def test_an_unconfirmed_occupant_leaves_the_outcome_unknown(self):
+        self.first_attempt_fails("drop")
+        self.send(key="k2", amount="0.5")
+        occupant = self.sent["k2"]["block_hash"]
+        self.node.unconfirmed = {occupant}
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+        self.assertIn(occupant, caught.exception.message)
+        self.assertIsNone(self.sent["k1"]["result"], "still held: it may yet win the fork")
+        self.assertEqual(len(self.sends_applied()), 1, "nothing published by the retry")
+        self.node.unconfirmed = set()       # the network decides: the occupant wins
+        with self.assertRaises(payments.ToolError) as decided:
+            self.send()
+        self.assertEqual(decided.exception.reason, "send_did_not_land")
+
+    def test_an_unconfirmed_occupant_found_by_walking_back_is_not_a_verdict(self):
+        self.first_attempt_fails("drop")
+        self.send(key="k2", amount="0.5")
+        self.send(key="k3", amount="0.5")
+        self.node.no_successor = True
+        self.node.unconfirmed = {self.sent["k2"]["block_hash"]}
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+
+    def test_an_occupant_this_node_cannot_describe_is_not_a_verdict(self):
+        # The successor names a block, but the node answers "not found" for
+        # it: nothing says it is confirmed, so nothing says ours lost.
+        self.first_attempt_fails("drop")
+        self.send(key="k2", amount="0.5")
+        self.node.forget = {self.sent["k2"]["block_hash"]}
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+
+
+class ARejectedBroadcastDoesNotHoldTheKey(unittest.TestCase):
+    """A node that REJECTS a block (bad work, bad signature, a balance that
+    does not add up) has answered: that block is invalid in itself and can
+    never land, on that node or any other. Its record must not stay behind
+    as an unknown broadcast - the same key would republish the same invalid
+    block for ever, and any other key on the same terms signs the same hash
+    and is refused as `duplicate_send`. A broadcast whose reply was LOST is
+    different and still holds the key (see the duplicate tests above).
+    """
+
+    BAD_WORK = "badbadbadbadbad0"
+
+    def setUp(self):
+        self.keys = keystore.KeyStore()
+        self.node = FlakyNode()
+        self.agent = payments.create_address(store="memory", keys=self.keys)["address"]
+        self.node.fund(self.agent, 10 * RAW)
+        payments.receive(self.agent, self.node, self.keys)
+        self.sent = {}
+        self.env = {"NANO_WALLET_ALLOW_SEND": "1"}
+        find_work = self.node.work_generate
+        self.bad_work_left = 1
+
+        def work_generate(root, subtype=None):
+            if subtype == "send" and self.bad_work_left:
+                self.bad_work_left -= 1
+                return self.BAD_WORK
+            return find_work(root, subtype)
+        self.node.work_generate = work_generate
+        process = self.node.process
+
+        def strict_process(block):
+            if block.get("work") == self.BAD_WORK:
+                self.node.calls.append("process")
+                raise nanonode.NodeError("block_rejected",
+                                         "the node rejected the block: Block work is less "
+                                         "than threshold")
+            return process(block)
+        self.node.process = strict_process
+
+    def send(self, key="k1", amount="1"):
+        return payments.send(self.agent, BURN, amount, key, self.node, self.keys,
+                             self.sent, env=self.env)
+
+    def sends_applied(self):
+        return [b for b in self.node.published if b.get("_subtype") == "send"]
+
+    def balance(self):
+        return self.node.accounts[self.agent]["balance_raw"]
+
+    def rejected_once(self):
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_rejected")
+        self.assertEqual(self.sends_applied(), [])
+        return caught.exception
+
+    def test_a_rejected_send_leaves_no_record(self):
+        refusal = self.rejected_once()
+        self.assertIn("work is less than threshold", refusal.message)
+        self.assertNotIn("k1", self.sent)
+
+    def test_the_same_key_retries_with_a_new_block_not_the_rejected_one(self):
+        self.rejected_once()
+        out = self.send()
+        self.assertNotIn("reconciled", out, "an ordinary send, not a settle")
+        self.assertEqual(len(self.sends_applied()), 1)
+        self.assertNotEqual(self.sends_applied()[0]["work"], self.BAD_WORK)
+        self.assertEqual(self.balance(), 9 * RAW, "paid exactly once")
+
+    def test_a_new_key_on_the_same_terms_is_not_a_duplicate_of_a_rejected_block(self):
+        self.rejected_once()
+        out = self.send(key="k2")
+        self.assertEqual(len(self.sends_applied()), 1)
+        self.assertEqual(out["block_hash"], fakenode._hash_of(self.sends_applied()[0]))
+        self.assertEqual(self.balance(), 9 * RAW)
+
+    def test_a_rebroadcast_the_node_rejects_frees_the_key(self):
+        # The first broadcast's reply was lost; the settle republishes the
+        # stored block, and the node rejects it. It can never land: say so,
+        # and let the key build a fresh block next time.
+        process = self.node.process
+        self.bad_work_left = 1
+
+        def lost(block):
+            self.node.calls.append("process")
+            raise nanonode.NodeError("node_unreachable", "the reply timed out")
+        self.node.process = lost
+        with self.assertRaises(payments.ToolError):
+            self.send()
+        self.assertIn("k1", self.sent, "a lost reply still holds the key")
+        with self.assertRaises(payments.ToolError) as dup:
+            self.send(key="k2")
+        self.assertEqual(dup.exception.reason, "duplicate_send")
+        self.node.process = process
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_rejected")
+        self.assertNotIn("k1", self.sent)
+        out = self.send()
+        self.assertEqual(len(self.sends_applied()), 1)
+        self.assertEqual(out["block_hash"], fakenode._hash_of(self.sends_applied()[0]))
+        self.assertEqual(self.balance(), 9 * RAW)
+
+    def test_an_unreachable_node_is_not_read_as_a_rejection(self):
+        process = self.node.process
+        self.bad_work_left = 0
+
+        def lost(block):
+            self.node.calls.append("process")
+            raise nanonode.NodeError("node_error", "the node refused with HTTP 429")
+        self.node.process = lost
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertNotEqual(caught.exception.reason, "send_rejected")
+        self.assertIn("k1", self.sent, "an answer that is not a verdict on the block holds the key")
+        self.node.process = process
+        with self.assertRaises(payments.ToolError) as dup:
+            self.send(key="k2")
+        self.assertEqual(dup.exception.reason, "duplicate_send")
+
+
 class AMandateRefusalLeavesNothingToRebroadcast(unittest.TestCase):
     """The mandate re-checks the cap when it reserves, just before broadcast.
 
@@ -359,6 +536,34 @@ class AMandateRefusalLeavesNothingToRebroadcast(unittest.TestCase):
         self.assertEqual(out["reconciled"], "landed")
         self.assertEqual(len(self.sends_applied()), 1)
         self.assertEqual(self.spent(), self.M.xno_to_raw("1"), "reserved once, not twice")
+
+    def test_a_rejected_broadcast_under_a_mandate_frees_the_key(self):
+        # The node rejected the block, so nothing was paid and the key is free.
+        # The mandate's reservation for it is still counted: mandate.py is
+        # vendored byte-for-byte and keeps every reservation whose send raised.
+        # That over-counts, which is the direction a spend cap may err in.
+        process = self.node.process
+
+        def reject(block):
+            raise nanonode.NodeError("block_rejected", "the node rejected the block: Bad signature")
+        self.node.process = reject
+        with self.assertRaises(payments.ToolError) as first:
+            self.send(amount="0.4")
+        self.assertEqual(first.exception.reason, "send_rejected")
+        self.assertNotIn("k1", self.sent)
+        self.node.process = process
+        out = self.send(amount="0.4")
+        self.assertEqual(len(self.sends_applied()), 1)
+        self.assertEqual(out["block_hash"], fakenode._hash_of(self.sends_applied()[0]))
+        self.assertEqual(self.spent(), self.M.xno_to_raw("0.8"))
+
+    def test_a_lost_reply_keeps_its_reservation(self):
+        def lost(block):
+            raise nanonode.NodeError("node_unreachable", "the reply timed out")
+        self.node.process = lost
+        with self.assertRaises(payments.ToolError):
+            self.send()
+        self.assertEqual(self.spent(), self.M.xno_to_raw("1"))
 
 
 if __name__ == "__main__":

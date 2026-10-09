@@ -311,6 +311,7 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
     except _keystore.KeyStoreError as exc:
         raise ToolError(exc.reason, exc.message) from None
 
+    record = None
     try:
         info = node.account_info(source)
         # Nano reads a send's amount as previous.balance - block.balance, and
@@ -390,6 +391,14 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
     except _mandate.MandateRefused as exc:
         raise _mandate_refusal(exc) from None
     except nanonode.NodeError as exc:
+        if exc.reason == "block_rejected" and record is not None:
+            # The node read the block and rejected it as invalid: it can never
+            # land, so it is not an unknown broadcast and must not hold the key.
+            # A record left here would be republished, unchanged and invalid,
+            # by every retry of this key, and would refuse every other key on
+            # the same terms as `duplicate_send` (identical terms sign to this
+            # same hash). A lost reply is NOT this, and still holds the key.
+            raise _rejected(sent, str(idempotency_key), record, exc) from None
         raise ToolError(exc.reason, exc.message, 503) from None
 
     result = {
@@ -402,6 +411,21 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
     sent[str(idempotency_key)] = {"to": destination, "amount_raw": amount_raw,
                                   "result": result, "block_hash": block_hash}
     return dict(result)
+
+
+def _rejected(sent: dict, idempotency_key: str, record: dict, exc) -> ToolError:
+    """The node rejected this key's block as invalid: drop its record, say so."""
+    if sent.get(idempotency_key) is record:
+        del sent[idempotency_key]
+    return ToolError(
+        "send_rejected",
+        "the node rejected block %s as invalid (%s), so it can never land and nothing "
+        "was paid under idempotency_key %r. The key is free: retrying this same call "
+        "signs a new block. If the same rejection comes back, the cause is in the "
+        "block itself (its work or signature), not in the network."
+        % (record.get("block_hash") or "(unknown)", exc.message, idempotency_key),
+        422,
+    )
 
 
 def _unknown(idempotency_key: str, record: dict, why: str) -> ToolError:
@@ -427,10 +451,13 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
       * it is not, and the account's frontier is still the block's `previous`:
         it can still be the next block, so the SAME signed block is published
         again - one hash, so it can only ever be one payment;
-      * it is not, and the frontier has moved to another block: the slot it
-        named is taken and it can never land - retry under a new key.
+      * it is not, and a CONFIRMED block other than it was built on its
+        `previous`: the slot it named is taken and it can never land - retry
+        under a new key. An occupant that is not confirmed yet is a fork ours
+        may still win, so that stays unknown.
     A lookup that fails leaves it unknown. Absence from the ledger alone is
-    never read as "never sent"; only a taken slot is.
+    never read as "never sent"; only a slot taken for good is. A rebroadcast
+    the node rejects as an invalid block frees the key (`send_rejected`).
     """
     block_hash = record.get("block_hash")
     if not block_hash:
@@ -457,7 +484,12 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
             if frontier == block_hash:
                 outcome, confirmed = "landed", False
             elif frontier == previous:
-                node.process(dict(record["block"]))
+                try:
+                    node.process(dict(record["block"]))
+                except nanonode.NodeError as exc:
+                    if exc.reason == "block_rejected":
+                        raise _rejected(sent, idempotency_key, record, exc) from None
+                    raise
                 outcome, confirmed = "rebroadcast", False
             else:
                 # The account moved on. That alone does not say our block lost
@@ -470,11 +502,22 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
                                    "the block is not on this node, the account has moved "
                                    "on to %s, and the node could not show which block "
                                    "was built on %s" % (frontier or "(none)", previous))
+                if occupant != block_hash and not (node.block_info(occupant) or {}).get("confirmed"):
+                    # Two blocks on one `previous` are a fork until the network
+                    # confirms one of them, and ours can still win it. Saying
+                    # "did not land" now tells the agent to pay again under a
+                    # new key - two payments if ours wins. Only a CONFIRMED
+                    # occupant proves ours never can.
+                    raise _unknown(idempotency_key, record,
+                                   "block %s was built on %s in its place, but it is not "
+                                   "confirmed, so this block may still win that fork"
+                                   % (occupant, previous))
                 if occupant != block_hash:
                     raise ToolError(
                         "send_did_not_land",
                         "idempotency_key %r broadcast block %s, which is not on the "
-                        "ledger: block %s was built on %s in its place, so it can never "
+                        "ledger: block %s was built on %s in its place and is confirmed, "
+                        "so it can never "
                         "land and nothing was paid under this key. To pay, retry with a "
                         "NEW idempotency_key."
                         % (idempotency_key, block_hash, occupant, previous),
