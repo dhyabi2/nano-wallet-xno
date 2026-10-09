@@ -41,7 +41,7 @@ class NodeError(Exception):
 
 
 class NanoNode:
-    """The RPC surface this wallet needs. Five calls, no more."""
+    """The RPC surface this wallet needs. Six calls, no more."""
 
     def account_info(self, address: str) -> dict:
         """`{"frontier","balance_raw","representative","block_count","confirmed"}`,
@@ -65,6 +65,11 @@ class NanoNode:
 
     def process(self, block: dict) -> str:
         """Publish a signed block; return its hash."""
+        raise NotImplementedError
+
+    def block_info(self, block_hash: str) -> dict:
+        """`{"account","confirmed"}` for a block on the ledger, or `{}` when this
+        node does not have it. Used only to settle a send whose reply was lost."""
         raise NotImplementedError
 
 
@@ -143,6 +148,10 @@ class HttpNanoNode(NanoNode):
             # (`account_info` turns a missing frontier into `{}`), and only for
             # that one call - anywhere else it is still a node error.
             if payload.get("action") == "account_info" and answer["error"] == "Account not found":
+                return {}
+            # Likewise `block_info` for a block the node does not have: an
+            # answer ("not here"), not a failure to reach the node.
+            if payload.get("action") == "block_info" and answer["error"] == "Block not found":
                 return {}
             raise NodeError("node_error", "the Nano node at %s returned: %s"
                             % (host_of(self.url), answer["error"]))
@@ -256,3 +265,10 @@ class HttpNanoNode(NanoNode):
             raise NodeError("publish_failed",
                             "the node at %s accepted no block" % host_of(self.url))
         return block_hash
+
+    def block_info(self, block_hash: str) -> dict:
+        answer = self._rpc({"action": "block_info", "json_block": "true", "hash": block_hash})
+        if not answer.get("block_account"):
+            return {}
+        return {"account": answer["block_account"],
+                "confirmed": str(answer.get("confirmed", "false")) == "true"}

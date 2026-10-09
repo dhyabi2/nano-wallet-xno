@@ -314,3 +314,13 @@ It does not send anything under `--profile receive-only`, and under the full
 profile it will not send without `NANO_WALLET_ALLOW_SEND=1`, above
 `NANO_WALLET_MAX_SEND_XNO` (default 1.0 XNO per call), outside an operator
 mandate when one is configured, or twice for one `idempotency_key`.
+
+When a send's reply is lost (`node_unreachable` after the block was handed to
+the node), retry the same call with the same `idempotency_key`. The wallet
+settles it from the ledger and never builds a second send: the block it signed
+is on the ledger (`reconciled: "landed"`); it is not, but the account has not
+moved since, so that same signed block is published again - one hash, at most
+one payment (`reconciled: "rebroadcast"`); or the account has moved on to a
+different block, so it can never land and nothing was paid (`send_did_not_land`,
+409 - retry under a new key). If the node cannot be asked, the answer stays
+`send_outcome_unknown` (409); do not switch keys while it is.

@@ -92,6 +92,13 @@ class FakeNode(nanonode.NanoNode):
         self.published.append(dict(block))
         return block_hash
 
+    def block_info(self, block_hash: str) -> dict:
+        self._guard("block_info")
+        for block in self.published:
+            if _hash_of(block) == block_hash:
+                return {"account": block["account"], "confirmed": True}
+        return {}
+
 
 def _hash_of(block: dict) -> str:
     """Recompute the block hash from the block, the way a node would."""

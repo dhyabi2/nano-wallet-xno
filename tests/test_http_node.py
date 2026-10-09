@@ -68,6 +68,21 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         with self.assertRaises(nanonode.NodeError):
             node.process({"type": "state", "_subtype": "send"})
 
+    def test_a_block_the_node_does_not_have_is_empty_not_an_error(self):
+        node, _ = self._node({"error": "Block not found"})
+        self.assertEqual(node.block_info("A" * 64), {})
+
+    def test_block_not_found_is_only_forgiven_for_block_info(self):
+        node, _ = self._node({"error": "Block not found"})
+        with self.assertRaises(nanonode.NodeError):
+            node.account_info(NEW)
+
+    def test_a_block_on_the_ledger_names_its_account_and_confirmation(self):
+        node, seen = self._node({"block_account": NEW, "confirmed": "true",
+                                 "contents": {"type": "state"}})
+        self.assertEqual(node.block_info("A" * 64), {"account": NEW, "confirmed": True})
+        self.assertEqual(json.loads(seen[-1].data)["action"], "block_info")
+
     def test_process_tells_the_node_the_block_subtype(self):
         # A receive built on a stale balance is rejected by the node rather than
         # published, but only because the node is told which direction the block

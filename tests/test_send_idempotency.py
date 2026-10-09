@@ -42,7 +42,13 @@ class LosesTheReply(fakenode.FakeNode):
     def __init__(self):
         super().__init__()
         self.lose_replies = False
+        self.lookups_fail = False
         self.process_calls = 0
+
+    def block_info(self, block_hash):
+        if self.lookups_fail:
+            raise nanonode.NodeError("node_unreachable", "the lookup timed out")
+        return super().block_info(block_hash)
 
     def process(self, block):
         self.process_calls += 1
@@ -71,32 +77,33 @@ class ABroadcastWhoseReplyWasLost(unittest.TestCase):
     def sends_published(self):
         return [b for b in self.node.published if b.get("_subtype") == "send"]
 
-    def test_the_retry_is_refused_rather_than_paying_a_second_time(self):
+    def test_the_retry_returns_the_landed_block_rather_than_paying_a_second_time(self):
         with self.assertRaises(payments.ToolError) as first:
             self.send()
         self.assertEqual(first.exception.reason, "node_unreachable")
-        with self.assertRaises(payments.ToolError) as second:
-            self.send()
-        self.assertEqual(second.exception.reason, "send_outcome_unknown")
-        self.assertEqual(second.exception.status, 409)
+        published = self.sends_published()[0]
+        second = self.send()        # settled from the ledger: see test_send_reconcile
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["block_hash"], fakenode._hash_of(published))
         self.assertEqual(len(self.sends_published()), 1, "the destination must be paid once")
 
-    def test_the_refusal_names_the_block_so_it_can_be_looked_up(self):
+    def test_when_it_cannot_be_looked_up_the_retry_is_refused_naming_the_block(self):
         with self.assertRaises(payments.ToolError):
             self.send()
         published = self.sends_published()[0]
+        self.node.lookups_fail = True
         with self.assertRaises(payments.ToolError) as caught:
             self.send()
+        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+        self.assertEqual(caught.exception.status, 409)
         self.assertIn(fakenode._hash_of(published), caught.exception.message)
+        self.assertEqual(len(self.sends_published()), 1)
 
-    def test_a_third_attempt_is_refused_the_same_way(self):
-        for _ in range(1):
-            with self.assertRaises(payments.ToolError):
-                self.send()
+    def test_a_third_attempt_pays_nothing_more(self):
+        with self.assertRaises(payments.ToolError):
+            self.send()
         for _ in range(2):
-            with self.assertRaises(payments.ToolError) as caught:
-                self.send()
-            self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+            self.assertTrue(self.send()["replayed"])
         self.assertEqual(len(self.sends_published()), 1)
 
     # -- controls: these must hold with or without the fix ------------------
@@ -141,13 +148,12 @@ class UnderAnOperatorMandate(unittest.TestCase):
         self.node.lose_replies = True
         self.sent = {}
 
-    def test_the_retry_is_refused_before_the_ledger_is_touched_again(self):
+    def test_the_retry_is_settled_before_the_ledger_is_touched_again(self):
         env = {"NANO_WALLET_ALLOW_SEND": "1"}
         with self.assertRaises(payments.ToolError):
             payments.send(self.agent, BURN, "1", "k", self.node, self.keys, self.sent, env=env)
-        with self.assertRaises(payments.ToolError) as caught:
-            payments.send(self.agent, BURN, "1", "k", self.node, self.keys, self.sent, env=env)
-        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+        out = payments.send(self.agent, BURN, "1", "k", self.node, self.keys, self.sent, env=env)
+        self.assertTrue(out["replayed"])
         self.assertEqual(self.node.process_calls, 2)   # the open, then the one send
 
 

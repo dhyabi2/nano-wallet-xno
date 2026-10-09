@@ -293,20 +293,10 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
             # block: Nano has no fee and no reversal, so a broadcast whose
             # outcome is unknown may well have landed. Replaying it would
             # rebuild from the NEW frontier and pay the destination a second
-            # time - the exact thing the key is here to stop. Refuse, and name
-            # the block so it can be looked up.
-            raise ToolError(
-                "send_outcome_unknown",
-                "idempotency_key %r already broadcast a send of %s XNO to %s as block %s, "
-                "and the node's reply did not arrive, so it is not known whether it "
-                "landed. Nothing was signed now. Look that block up on the ledger: if it "
-                "is there the payment is made; if it is not, retry with a NEW "
-                "idempotency_key. Repeating this one would build a second send from the "
-                "account's new frontier and pay twice."
-                % (idempotency_key, _six(previous_call["amount_raw"]), previous_call["to"],
-                   previous_call.get("block_hash") or "(unknown)"),
-                409,
-            )
+            # time - the exact thing the key is here to stop. Settle it from
+            # the ledger instead; refuse only when the ledger cannot say.
+            return _settle_unknown_send(source, str(idempotency_key), previous_call,
+                                        node, sent)
         return dict(previous_call["result"], replayed=True)
 
     guard = _mandate_guard(env, source)  # after the replay: a replay sends nothing
@@ -368,8 +358,13 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
         # under-counting is how the same payment goes out twice. Until the
         # node's reply arrives this entry carries no result, which is what
         # makes the replay above a refusal rather than a second send.
+        # `previous` and the signed block itself are kept so that a retry can
+        # settle an unknown outcome: publish this same block again (one hash,
+        # so at most one payment), or know that its slot was taken.
         sent[str(idempotency_key)] = {"to": destination, "amount_raw": amount_raw,
-                                      "result": None, "block_hash": block_hash}
+                                      "result": None, "block_hash": block_hash,
+                                      "previous": previous.hex().upper(),
+                                      "block": dict(signed)}
         if guard is None:
             node.process(dict(signed))
         else:
@@ -392,6 +387,78 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
     sent[str(idempotency_key)] = {"to": destination, "amount_raw": amount_raw,
                                   "result": result, "block_hash": block_hash}
     return dict(result)
+
+
+def _unknown(idempotency_key: str, record: dict, why: str) -> ToolError:
+    return ToolError(
+        "send_outcome_unknown",
+        "idempotency_key %r already broadcast a send of %s XNO to %s as block %s, "
+        "and the node's reply did not arrive, so it is not known whether it "
+        "landed (%s). Nothing new was signed. Retry this same call to look it up "
+        "again. Do not switch to a NEW idempotency_key while this is unknown: "
+        "that would build a second send and may pay twice."
+        % (idempotency_key, _six(record["amount_raw"]), record["to"],
+           record.get("block_hash") or "(unknown)", why),
+        409,
+    )
+
+
+def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
+                         node: nanonode.NanoNode, sent: dict) -> dict:
+    """Turn a send whose reply was lost into a known outcome, from the ledger.
+
+    Three facts, none of which can be mistaken for another:
+      * the block is on the ledger: the payment is made;
+      * it is not, and the account's frontier is still the block's `previous`:
+        it can still be the next block, so the SAME signed block is published
+        again - one hash, so it can only ever be one payment;
+      * it is not, and the frontier has moved to another block: the slot it
+        named is taken and it can never land - retry under a new key.
+    A lookup that fails leaves it unknown. Absence from the ledger alone is
+    never read as "never sent"; only a taken slot is.
+    """
+    block_hash = record.get("block_hash")
+    if not block_hash:
+        raise _unknown(idempotency_key, record, "no block hash was recorded")
+    try:
+        found = node.block_info(block_hash)
+        if found:
+            outcome = "landed"
+            confirmed = bool(found.get("confirmed"))
+        else:
+            if not record.get("previous") or not record.get("block"):
+                raise _unknown(idempotency_key, record,
+                               "the block is not on this node and this record cannot "
+                               "tell whether it still can be")
+            frontier = (node.account_info(source).get("frontier") or "").upper()
+            if frontier not in (record["previous"].upper(), block_hash.upper()):
+                raise ToolError(
+                    "send_did_not_land",
+                    "idempotency_key %r broadcast block %s, which is not on the ledger, "
+                    "and the account has since moved on to block %s, so that block can "
+                    "never land: nothing was paid under this key. To pay, retry with a "
+                    "NEW idempotency_key."
+                    % (idempotency_key, block_hash, frontier or "(none)"),
+                    409,
+                )
+            if frontier == block_hash.upper():
+                outcome, confirmed = "landed", False
+            else:
+                node.process(dict(record["block"]))
+                outcome, confirmed = "rebroadcast", False
+    except nanonode.NodeError as exc:
+        raise _unknown(idempotency_key, record, exc.message) from None
+
+    result = {
+        "block_hash": block_hash,
+        "amount_xno": _six(record["amount_raw"]),
+        "to": record["to"],
+        "confirmed": confirmed,
+        "receipt": "https://nanolooker.com/block/%s" % block_hash,
+    }
+    sent[idempotency_key] = {"to": record["to"], "amount_raw": record["amount_raw"],
+                             "result": result, "block_hash": block_hash}
+    return dict(result, replayed=True, reconciled=outcome)
 
 
 # ---------------------------------------------------------------- operator mandate
