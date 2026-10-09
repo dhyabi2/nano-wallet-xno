@@ -114,7 +114,7 @@ def create_address(label: str = None, store: str = "memory", path: str = None,
         try:
             written = keys.save(private_key, path)
         except _keystore.KeyStoreError as exc:
-            raise ToolError(exc.reason, exc.message) from None
+            raise ToolError(exc.reason, exc.message, **exc.extra) from None
         stored = "file:%s" % written
     else:
         stored = "memory (lost on restart)"
