@@ -63,15 +63,33 @@ re-commented; see the end of this file.
 
 ## Found
 
-Nothing worth a patch this run.
+Nothing worth a patch this run. One claim-vs-coverage gap is recorded, shown rather than asserted:
+
+- **Python 3.8 and 3.9 are promised and tested nowhere.** `README.md:7` says "Python 3.8+ and the
+  standard library", `pyproject.toml:10` says `requires-python = ">=3.8"`, and
+  `.github/workflows/test.yml:33` runs the matrix `["3.10", "3.11", "3.12", "3.13"]` - its own
+  comment on line 8 saying so in as many words ("The matrix is 3.10-3.13, the four the sibling
+  repositories run and prove"). So an agent on 3.8 or 3.9 is told the install is supported, and
+  nothing would catch a regression that broke it.
+  **This is a coverage gap and not a live break:** the package was scanned for every construct that
+  would fail below 3.10 - `str.removeprefix`/`removesuffix` (3.9), `match`/`case` (3.10),
+  `zoneinfo`/`graphlib` (3.9), `functools.cache` (3.9), `int.bit_count` (3.10) and builtin-generic
+  annotations such as `-> list[str]` outside a `from __future__ import annotations` module - and
+  **none appears anywhere in the tree**. The floor is therefore plausible; it is simply unproven.
+  No patch is offered: widening the matrix is the obvious fix, but it cannot be validated from this
+  environment (no 3.8 or 3.9 interpreter is installed), and `test.yml`'s comment reads as a
+  deliberate narrowing rather than an oversight, so it is the owner's call rather than a routine's.
+  For contrast, the sibling `nano-finality-proof` claims 3.9+ and proves it - its matrix starts at
+  3.9.
 
 ## Could not verify
 
 - **Anything against a real Nano node.** This environment's network policy answers 403 to CONNECT
   for the public RPC hosts, so `balance` and `receive` are exercised only against `fakenode.py`
   and the recorded shapes in the tests. No XNO moved.
-- **The README's "Python 3.8+" floor.** Only 3.11, 3.12 and 3.13 are installed here. The install and
-  the suite were run on 3.11; 3.8 through 3.10 are unexecuted.
+- **The README's "Python 3.8+" floor.** Only 3.11, 3.12 and 3.13 are installed here; the install
+  and the suite were run on 3.11. 3.8 and 3.9 are unexecuted here *and* in CI - see "Found" above,
+  where that gap is recorded with its file and line numbers. 3.10 is covered by CI.
 
 ## Left alone on purpose
 
