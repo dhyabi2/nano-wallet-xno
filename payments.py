@@ -361,17 +361,32 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
         # `previous` and the signed block itself are kept so that a retry can
         # settle an unknown outcome: publish this same block again (one hash,
         # so at most one payment), or know that its slot was taken.
-        sent[str(idempotency_key)] = {"to": destination, "amount_raw": amount_raw,
-                                      "result": None, "block_hash": block_hash,
-                                      "previous": previous.hex().upper(),
-                                      "block": dict(signed)}
+        #
+        # Written inside the broadcast step, never before it: a record with no
+        # result is what a retry reads as "published, reply lost" and settles
+        # by publishing this block again without asking the mandate a second
+        # time. So it must not exist for a block the mandate refused when it
+        # re-checked the cap at reservation - that retry would publish a
+        # refused block past the operator's cap.
+        holder = _key_holding(sent, block_hash, str(idempotency_key))
+        if holder is not None:
+            raise _duplicate(str(idempotency_key), holder, block_hash)
+        record = {"to": destination, "amount_raw": amount_raw,
+                  "result": None, "block_hash": block_hash,
+                  "previous": previous.hex().upper(),
+                  "block": dict(signed)}
+
+        def broadcast():
+            sent[str(idempotency_key)] = record
+            return node.process(dict(signed))
+
         if guard is None:
-            node.process(dict(signed))
+            broadcast()
         else:
             # Reserved in the mandate ledger BEFORE the block is broadcast; a
             # broadcast that raises stays counted, because it may have landed.
-            guard.spend(destination, amount_raw, lambda: node.process(dict(signed)),
-                        ref=str(idempotency_key))
+            # A refused reservation raises before broadcast() runs.
+            guard.spend(destination, amount_raw, broadcast, ref=str(idempotency_key))
     except _mandate.MandateRefused as exc:
         raise _mandate_refusal(exc) from None
     except nanonode.NodeError as exc:
@@ -420,6 +435,13 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
     block_hash = record.get("block_hash")
     if not block_hash:
         raise _unknown(idempotency_key, record, "no block hash was recorded")
+    block_hash = block_hash.upper()
+    # Identical terms on the same frontier sign to the identical block. If
+    # another key has already settled this hash, the one payment it can make
+    # is that key's; settling it here as well would report it twice.
+    holder = _key_holding(sent, block_hash, idempotency_key, settled_only=True)
+    if holder is not None:
+        raise _duplicate(idempotency_key, holder, block_hash)
     try:
         found = node.block_info(block_hash)
         if found:
@@ -430,22 +452,35 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
                 raise _unknown(idempotency_key, record,
                                "the block is not on this node and this record cannot "
                                "tell whether it still can be")
+            previous = record["previous"].upper()
             frontier = (node.account_info(source).get("frontier") or "").upper()
-            if frontier not in (record["previous"].upper(), block_hash.upper()):
-                raise ToolError(
-                    "send_did_not_land",
-                    "idempotency_key %r broadcast block %s, which is not on the ledger, "
-                    "and the account has since moved on to block %s, so that block can "
-                    "never land: nothing was paid under this key. To pay, retry with a "
-                    "NEW idempotency_key."
-                    % (idempotency_key, block_hash, frontier or "(none)"),
-                    409,
-                )
-            if frontier == block_hash.upper():
+            if frontier == block_hash:
                 outcome, confirmed = "landed", False
-            else:
+            elif frontier == previous:
                 node.process(dict(record["block"]))
                 outcome, confirmed = "rebroadcast", False
+            else:
+                # The account moved on. That alone does not say our block lost
+                # its slot: it may sit under the blocks that came after it, on
+                # a node that does not answer for it. Only the block actually
+                # built on `previous` says which.
+                occupant = _slot_occupant(node, previous, frontier, block_hash)
+                if occupant is None:
+                    raise _unknown(idempotency_key, record,
+                                   "the block is not on this node, the account has moved "
+                                   "on to %s, and the node could not show which block "
+                                   "was built on %s" % (frontier or "(none)", previous))
+                if occupant != block_hash:
+                    raise ToolError(
+                        "send_did_not_land",
+                        "idempotency_key %r broadcast block %s, which is not on the "
+                        "ledger: block %s was built on %s in its place, so it can never "
+                        "land and nothing was paid under this key. To pay, retry with a "
+                        "NEW idempotency_key."
+                        % (idempotency_key, block_hash, occupant, previous),
+                        409,
+                    )
+                outcome, confirmed = "landed", False
     except nanonode.NodeError as exc:
         raise _unknown(idempotency_key, record, exc.message) from None
 
@@ -459,6 +494,65 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
     sent[idempotency_key] = {"to": record["to"], "amount_raw": record["amount_raw"],
                              "result": result, "block_hash": block_hash}
     return dict(result, replayed=True, reconciled=outcome)
+
+
+# How far back from the frontier a settle will read the chain to find which
+# block took a slot, when the node does not report `successor`. Past this the
+# outcome stays unknown rather than guessed.
+_WALK_LIMIT = 64
+
+
+def _slot_occupant(node: nanonode.NanoNode, previous: str, frontier: str, ours: str):
+    """The hash of the block built on `previous` on this account, or None.
+
+    Read from the ledger, never inferred: the node's `successor` for
+    `previous` when it reports one, otherwise the chain read back from the
+    frontier one `previous` at a time. None when neither reaches it.
+    """
+    successor = (node.block_info(previous) or {}).get("successor")
+    if successor:
+        return successor.upper()
+    cursor = frontier
+    for _ in range(_WALK_LIMIT):
+        if not cursor:
+            return None
+        if cursor == ours:
+            return ours
+        back = ((node.block_info(cursor) or {}).get("previous") or "").upper()
+        if not back or not back.strip("0"):
+            return None
+        if back == previous:
+            return cursor
+        cursor = back
+    return None
+
+
+def _key_holding(sent: dict, block_hash: str, idempotency_key: str, settled_only: bool = False):
+    """Another idempotency key already recorded with this block hash, or None.
+
+    `settled_only` counts only a key whose payment is known (it has a result):
+    of two keys left holding one unknown block, the first to settle takes it.
+    """
+    for key, record in list(sent.items()):
+        if key == idempotency_key or str(record.get("block_hash") or "").upper() != block_hash.upper():
+            continue
+        if settled_only and record.get("result") is None:
+            continue
+        return key
+    return None
+
+
+def _duplicate(idempotency_key: str, holder: str, block_hash: str) -> ToolError:
+    return ToolError(
+        "duplicate_send",
+        "idempotency_key %r would publish block %s, the identical block idempotency_key "
+        "%r already holds (same account, frontier, destination and amount sign to the "
+        "same block, and one block is one payment: %r's). Nothing was published by "
+        "this call and no payment is counted under %r. Retry %r to learn that "
+        "payment's outcome; once it has landed, a new key builds a new block."
+        % (idempotency_key, block_hash, holder, holder, idempotency_key, holder),
+        409,
+    )
 
 
 # ---------------------------------------------------------------- operator mandate

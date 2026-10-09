@@ -96,7 +96,13 @@ class FakeNode(nanonode.NanoNode):
         self._guard("block_info")
         for block in self.published:
             if _hash_of(block) == block_hash:
-                return {"account": block["account"], "confirmed": True}
+                found = {"account": block["account"], "confirmed": True,
+                         "previous": block["previous"].upper()}
+                for later in self.published:
+                    if (later["account"] == block["account"]
+                            and later["previous"].upper() == block_hash.upper()):
+                        found["successor"] = _hash_of(later)
+                return found
         return {}
 
 

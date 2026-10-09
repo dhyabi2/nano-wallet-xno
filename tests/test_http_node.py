@@ -83,6 +83,20 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         self.assertEqual(node.block_info("A" * 64), {"account": NEW, "confirmed": True})
         self.assertEqual(json.loads(seen[-1].data)["action"], "block_info")
 
+    def test_a_block_on_the_ledger_names_the_blocks_either_side_of_it(self):
+        node, _ = self._node({"block_account": NEW, "confirmed": "false",
+                              "successor": "b" * 64,
+                              "contents": {"type": "state", "previous": "a" * 64}})
+        self.assertEqual(node.block_info("C" * 64),
+                         {"account": NEW, "confirmed": False,
+                          "previous": "A" * 64, "successor": "B" * 64})
+
+    def test_a_zero_successor_is_no_successor(self):
+        node, _ = self._node({"block_account": NEW, "confirmed": "true",
+                              "successor": "0" * 64,
+                              "contents": {"type": "state", "previous": "not a hash"}})
+        self.assertEqual(node.block_info("C" * 64), {"account": NEW, "confirmed": True})
+
     def test_process_tells_the_node_the_block_subtype(self):
         # A receive built on a stale balance is rejected by the node rather than
         # published, but only because the node is told which direction the block

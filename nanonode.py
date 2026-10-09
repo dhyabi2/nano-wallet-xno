@@ -69,7 +69,9 @@ class NanoNode:
 
     def block_info(self, block_hash: str) -> dict:
         """`{"account","confirmed"}` for a block on the ledger, or `{}` when this
-        node does not have it. Used only to settle a send whose reply was lost."""
+        node does not have it, plus `previous` (the block it builds on) and
+        `successor` (the block built on it) when the node reports them. Used
+        only to settle a send whose reply was lost."""
         raise NotImplementedError
 
 
@@ -270,5 +272,24 @@ class HttpNanoNode(NanoNode):
         answer = self._rpc({"action": "block_info", "json_block": "true", "hash": block_hash})
         if not answer.get("block_account"):
             return {}
-        return {"account": answer["block_account"],
-                "confirmed": str(answer.get("confirmed", "false")) == "true"}
+        found = {"account": answer["block_account"],
+                 "confirmed": str(answer.get("confirmed", "false")) == "true"}
+        contents = answer.get("contents")
+        if isinstance(contents, dict) and _is_hash(contents.get("previous")):
+            found["previous"] = contents["previous"].upper()
+        # "0" * 64 is the node's way of saying nothing is built on this block
+        # yet; it is not a block, so it is left out rather than passed on.
+        successor = answer.get("successor")
+        if _is_hash(successor) and successor.strip("0"):
+            found["successor"] = successor.upper()
+        return found
+
+
+def _is_hash(value) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True

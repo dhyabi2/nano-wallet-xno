@@ -268,7 +268,7 @@ of any mandate.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 169 tests — OK
+Ran 180 tests — OK
 
 $ python3 e2e_check.py
 15/15 checks passed
@@ -320,7 +320,10 @@ the node), retry the same call with the same `idempotency_key`. The wallet
 settles it from the ledger and never builds a second send: the block it signed
 is on the ledger (`reconciled: "landed"`); it is not, but the account has not
 moved since, so that same signed block is published again - one hash, at most
-one payment (`reconciled: "rebroadcast"`); or the account has moved on to a
-different block, so it can never land and nothing was paid (`send_did_not_land`,
-409 - retry under a new key). If the node cannot be asked, the answer stays
-`send_outcome_unknown` (409); do not switch keys while it is.
+one payment (`reconciled: "rebroadcast"`); or a different block was built where
+it would have gone, so it can never land and nothing was paid (`send_did_not_land`,
+409 - retry under a new key). If the node cannot be asked, or cannot show which
+block was built there, the answer stays `send_outcome_unknown` (409); do not
+switch keys while it is. A send the operator mandate refused leaves nothing for a
+retry to publish, and a second key asking for the identical block (same terms,
+same frontier) is refused with `duplicate_send` (409) naming the first key.

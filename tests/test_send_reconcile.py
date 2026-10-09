@@ -51,6 +51,8 @@ class FlakyNode(fakenode.FakeNode):
         super().__init__()
         self.mode = None
         self.lookups_fail = False
+        self.forget = set()          # hashes this node answers "not found" for
+        self.no_successor = False    # a node that does not report `successor`
 
     def process(self, block):
         if self.mode == "drop":
@@ -65,7 +67,13 @@ class FlakyNode(fakenode.FakeNode):
         if self.lookups_fail:
             self.calls.append("block_info")
             raise nanonode.NodeError("node_unreachable", "the lookup timed out")
-        return super().block_info(block_hash)
+        if block_hash in self.forget:
+            self.calls.append("block_info")
+            return {}
+        found = super().block_info(block_hash)
+        if self.no_successor:
+            found.pop("successor", None)
+        return found
 
 
 class AnUnknownSendIsSettledFromTheLedger(unittest.TestCase):
@@ -179,6 +187,178 @@ class AnUnknownSendIsSettledFromTheLedger(unittest.TestCase):
             self.send()
         self.assertEqual(caught.exception.reason, "spend_not_enabled")
         self.assertEqual(self.sends_applied(), [])
+
+    # -- the slot is read from the chain, not from one lookup -----------------
+
+    def test_a_landed_block_this_node_cannot_find_is_not_called_lost(self):
+        # The block landed and the account moved past it, but this node does
+        # not answer for it (pruned, or a different node behind a balancer).
+        # "Not found and the frontier moved" used to read as send_did_not_land,
+        # which tells the agent to pay again under a new key: a second payment.
+        self.first_attempt_fails("lose_reply")
+        landed = fakenode._hash_of(self.sends_applied()[0])
+        self.send(key="k2", amount="0.5")
+        self.node.forget = {landed}
+        out = self.send()
+        self.assertEqual(out["block_hash"], landed)
+        self.assertEqual(out["reconciled"], "landed")
+        self.assertEqual(len(self.sends_applied()), 2)
+
+    def test_the_successor_of_previous_settles_it_when_the_chain_cannot_be_walked(self):
+        self.first_attempt_fails("lose_reply")
+        landed = fakenode._hash_of(self.sends_applied()[0])
+        self.send(key="k2", amount="0.5")
+        self.node.forget = {landed, self.sent["k2"]["block_hash"]}
+        out = self.send()
+        self.assertEqual((out["block_hash"], out["reconciled"]), (landed, "landed"))
+
+    def test_a_landed_block_is_found_by_walking_back_when_no_successor_is_reported(self):
+        self.first_attempt_fails("lose_reply")
+        landed = fakenode._hash_of(self.sends_applied()[0])
+        self.send(key="k2", amount="0.5")
+        self.send(key="k3", amount="0.5")
+        self.node.forget = {landed}
+        self.node.no_successor = True
+        out = self.send()
+        self.assertEqual(out["reconciled"], "landed")
+        self.assertEqual(out["block_hash"], landed)
+
+    def test_a_taken_slot_is_still_named_when_found_by_walking_back(self):
+        self.first_attempt_fails("drop")
+        self.send(key="k2", amount="0.5")
+        self.send(key="k3", amount="0.5")
+        self.node.no_successor = True
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_did_not_land")
+        self.assertEqual(len(self.sends_applied()), 2)
+
+    def test_when_the_chain_cannot_be_read_back_the_outcome_stays_unknown(self):
+        self.first_attempt_fails("lose_reply")
+        landed = fakenode._hash_of(self.sends_applied()[0])
+        self.send(key="k2", amount="0.5")
+        self.node.forget = {landed, self.sent["k2"]["block_hash"]}
+        self.node.no_successor = True
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+        self.assertEqual(len(self.sends_applied()), 2)
+
+    # -- one block, one key ---------------------------------------------------
+
+    def test_a_second_key_cannot_claim_the_identical_block(self):
+        # Identical terms on the same frontier sign to the identical block. A
+        # second key that "sent" it would report a payment that is the first
+        # key's, and the agent would believe it paid twice.
+        self.first_attempt_fails("drop")
+        held = self.sent["k1"]["block_hash"]
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send(key="k2")
+        self.assertEqual(caught.exception.reason, "duplicate_send")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn("k1", caught.exception.message)
+        self.assertEqual(self.sends_applied(), [])
+        self.assertNotIn("k2", self.sent)
+        out = self.send()                   # the first key settles it
+        self.assertEqual((out["block_hash"], out["reconciled"]), (held, "rebroadcast"))
+        self.assertEqual(self.balance(), 9 * RAW)
+
+    def test_a_block_already_held_by_another_key_is_not_settled_twice(self):
+        # Records written before the refusal above existed: two keys, one hash.
+        self.first_attempt_fails("lose_reply")
+        self.sent["k2"] = dict(self.sent["k1"])
+        first = self.send(key="k2")
+        self.assertEqual(first["reconciled"], "landed")
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send(key="k1")
+        self.assertEqual(caught.exception.reason, "duplicate_send")
+        self.assertEqual(len(self.sends_applied()), 1)
+
+
+class AMandateRefusalLeavesNothingToRebroadcast(unittest.TestCase):
+    """The mandate re-checks the cap when it reserves, just before broadcast.
+
+    The send's own record of the signed block used to be written before that
+    reservation. When the reservation refused (another process spent the cap
+    while this one was finding work), the record stayed, with no result - the
+    shape of a broadcast whose reply was lost. The retry then "settled" it by
+    publishing that block, which the mandate had refused, past the cap.
+    """
+
+    def setUp(self):
+        import json
+        import shutil
+        import tempfile
+        import mandate as M
+        self.M = M
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.keys = keystore.KeyStore()
+        self.node = fakenode.FakeNode()
+        self.agent = payments.create_address(store="memory", keys=self.keys)["address"]
+        self.node.fund(self.agent, 10 * RAW)
+        payments.receive(self.agent, self.node, self.keys)
+        operator_key = bytes(range(1, 33))
+        operator = M.address_from_public_key(M.public_key_from_private(operator_key))
+        signed = M.sign_mandate(
+            M.build_mandate(self.agent, operator, M.xno_to_raw("1"), M.xno_to_raw("1"),
+                            "Pay the burn address in tests", "2030-01-01T00:00:00Z",
+                            allowed_payees=[BURN]),
+            operator_key)
+        self.path = os.path.join(self.tmp, "mandate.json")
+        with open(self.path, "w") as fh:
+            json.dump(signed, fh)
+        self.env = {"NANO_WALLET_ALLOW_SEND": "1", "NANO_WALLET_MANDATE": self.path}
+        self.sent = {}
+
+    def send(self, key="k1", amount="1"):
+        return payments.send(self.agent, BURN, amount, key, self.node, self.keys,
+                             self.sent, env=self.env)
+
+    def spent(self):
+        return int(self.M.MandateGuard.from_file(self.path, agent=self.agent).status()["spent_raw"])
+
+    def sends_applied(self):
+        return [b for b in self.node.published if b.get("_subtype") == "send"]
+
+    def another_process_spends_while_work_is_found(self, amount="0.6"):
+        find_work = self.node.work_generate
+        other = self.M.MandateGuard.from_file(self.path, agent=self.agent)
+
+        def work_generate(root, subtype=None):
+            if subtype == "send" and not getattr(self, "_raced", False):
+                self._raced = True
+                other.spend(BURN, self.M.xno_to_raw(amount), lambda: None, ref="other")
+            return find_work(root, subtype)
+        self.node.work_generate = work_generate
+
+    def test_a_refused_reservation_is_not_rebroadcast_on_retry(self):
+        self.another_process_spends_while_work_is_found()
+        with self.assertRaises(payments.ToolError) as first:
+            self.send()
+        self.assertEqual(first.exception.reason, "mandate_refused")
+        self.assertEqual(self.sends_applied(), [])
+        self.assertNotIn("k1", self.sent, "a refused send left a record a retry would publish")
+        with self.assertRaises(payments.ToolError) as again:
+            self.send()
+        self.assertEqual(again.exception.reason, "mandate_refused")
+        self.assertEqual(self.sends_applied(), [], "the refused block was published on retry")
+        self.assertEqual(self.spent(), self.M.xno_to_raw("0.6"), "the cap's ledger is unchanged")
+
+    def test_a_reserved_send_whose_reply_was_lost_is_still_settled(self):
+        process = self.node.process
+
+        def lose_reply(block):
+            process(block)
+            raise nanonode.NodeError("node_unreachable", "the reply timed out")
+        self.node.process = lose_reply
+        with self.assertRaises(payments.ToolError):
+            self.send()
+        self.node.process = process
+        out = self.send()
+        self.assertEqual(out["reconciled"], "landed")
+        self.assertEqual(len(self.sends_applied()), 1)
+        self.assertEqual(self.spent(), self.M.xno_to_raw("1"), "reserved once, not twice")
 
 
 if __name__ == "__main__":
