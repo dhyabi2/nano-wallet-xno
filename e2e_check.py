@@ -120,11 +120,75 @@ def _():
     assert names == list(profiles.tools_for(profiles.DEFAULT_PROFILE)), names
 
 
+# The root tests/test_work.py reads off the mainnet, and work for it that
+# clears the SEND threshold - the one no free public node will do. Found here by
+# `work.solve_parallel` on four cores in 137 seconds.
+WORK_ROOT = "8789CF4B88407CB006F5A53F6FEEECFCDC6E56F8AE51B9BBF806317A33643490"
+SEND_WORK = "0ba27e49039735a0"
+
+
+@check("a send's proof-of-work is findable without a node, and the vector proves it")
+def _():
+    import work
+    assert work.validates(bytes.fromhex(WORK_ROOT), SEND_WORK, work.SEND_THRESHOLD)
+    # The same root's network-accepted receive work does NOT clear it, so this
+    # is the two thresholds differing and not the two roots differing.
+    assert not work.validates(bytes.fromhex(WORK_ROOT), "58fc8abfa35fcfee",
+                              work.SEND_THRESHOLD)
+
+
+@check("`work estimate` says what a send costs on THIS machine, measured")
+def _():
+    run = subprocess.run([sys.executable, "cli.py", "work", "estimate",
+                          "--seconds", "0.1"], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    said = json.loads(run.stdout)
+    assert said["hashes_per_second"] > 0, said
+    assert said["send"]["expected_hashes"] == 2 ** 29, said
+    assert said["receive"]["expected_hashes"] == 2 ** 23, said
+    assert said["send"]["average_seconds"] > said["receive"]["average_seconds"]
+
+
+@check("`work precompute` stores verified work the next block can be sent with")
+def _():
+    import tempfile
+
+    import prework
+    import work
+    with tempfile.TemporaryDirectory() as cache:
+        run = subprocess.run([sys.executable, "cli.py", "work", "precompute",
+                              WORK_ROOT, "--threshold", "receive",
+                              "--cache", cache, "--budget", "300"],
+                             capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        said = json.loads(run.stdout)
+        assert said["precomputed"] == WORK_ROOT, said
+        # Read back by a SECOND process, through the same reader the send path
+        # uses, and verified here rather than taken from the report.
+        held = prework.WorkCache(cache).get(WORK_ROOT, work.RECEIVE_THRESHOLD)
+        assert held == said["work"], (held, said)
+        assert work.validates(bytes.fromhex(WORK_ROOT), held, work.RECEIVE_THRESHOLD)
+        listed = subprocess.run([sys.executable, "cli.py", "work", "pending",
+                                 "--cache", cache], capture_output=True, text=True)
+        assert json.loads(listed.stdout)["have_work_for"] == [WORK_ROOT], listed.stdout
+
+
+@check("the work cache is off, not defaulted, when nothing configures it")
+def _():
+    import prework
+    assert prework.WorkCache.from_env({}) is None
+    bare = {k: v for k, v in os.environ.items() if k != prework.CACHE_ENV}
+    run = subprocess.run([sys.executable, "cli.py", "work", "pending"],
+                         capture_output=True, text=True, env=bare)
+    assert run.returncode == 2, run.stdout
+    assert json.loads(run.stdout)["error"] == "no_work_cache", run.stdout
+
+
 #: Every module that must be unable to reach the network, checked TRANSITIVELY:
 #: it is not enough that they do not import urllib themselves, because an import
 #: two hops away reaches the network just as well.
 OFFLINE_MODULES = ("nanoaddr", "ed25519_blake2b", "wallet", "blocks", "keystore",
-                   "profiles", "capabilities")
+                   "profiles", "capabilities", "work", "prework")
 
 NETWORK_MODULES = ("socket", "http", "urllib", "requests", "ssl", "asyncio", "ftplib")
 

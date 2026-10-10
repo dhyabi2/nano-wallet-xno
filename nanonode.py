@@ -16,6 +16,7 @@ import json
 import urllib.error
 import urllib.request
 
+import prework as _prework
 import work as _work
 
 DEFAULT_TIMEOUT = 10.0
@@ -129,11 +130,16 @@ def host_of(url: str) -> str:
         return "the configured node"
 
 
+#: `prework=None` must mean "no cache, whatever the environment says", so the
+#: default cannot be None.
+_UNSET = object()
+
+
 class HttpNanoNode(NanoNode):
     """A Nano node's JSON-RPC endpoint, over urllib. No dependencies."""
 
     def __init__(self, url: str, timeout: float = DEFAULT_TIMEOUT, auth_header: str = None,
-                 local_work: bool = True):
+                 local_work: bool = True, prework=_UNSET):
         if not url:
             raise NodeError("node_not_configured",
                             "no node URL: set NANO_NODE_URL to a Nano RPC endpoint")
@@ -143,6 +149,12 @@ class HttpNanoNode(NanoNode):
         # Public nodes refuse `work_generate`, and a new wallet has no other
         # node. Set False to require the node to supply work.
         self.local_work = local_work
+        # Work this wallet found before the payment (`prework.py`). None, and
+        # every line below that touches it is dead, unless the environment
+        # names a cache directory - so an install that has not asked for this
+        # behaves exactly as it did before the cache existed. Pass None to
+        # refuse it explicitly even when the environment configures one.
+        self.prework = _prework.WorkCache.from_env() if prework is _UNSET else prework
 
     def _rpc(self, payload: dict) -> dict:
         body = json.dumps(payload).encode("utf-8")
@@ -285,7 +297,16 @@ class HttpNanoNode(NanoNode):
         asked first and is faster. Nothing that spends falls back (see
         `work.LOCAL_SUBTYPES`) - at the send threshold this would take minutes,
         and a send whose node owes it work should say so, not stall.
+
+        Work found BEFORE the payment is different, and is read first of all:
+        it is already paid for, it is verified against this root and this
+        subtype's threshold before it is used, and reading a file beats a
+        network round trip. That is the one route by which a send gets work
+        without a node - see `prework.py`.
         """
+        cached = self._precomputed(root_hex, subtype)
+        if cached:
+            return cached
         try:
             answer = self._rpc({"action": "work_generate", "hash": root_hex})
             work = answer.get("work")
@@ -299,6 +320,25 @@ class HttpNanoNode(NanoNode):
         if work:
             return work
         return self._local_work(root_hex, subtype)
+
+    def _precomputed(self, root_hex: str, subtype: str = None):
+        """Work found ahead of this payment, or None.
+
+        A cache that cannot be read is a miss, never an error: the node is
+        still there, and a wallet must not fail to pay because a directory
+        was removed between two calls.
+        """
+        # `local_work=False` means this wallet does no proof-of-work of its
+        # own and the node must supply it. Work out of the cache IS work this
+        # wallet did, just earlier, so that switch turns the cache off too -
+        # the conservative reading, and the one that cannot surprise a caller
+        # who disabled local work on purpose.
+        if self.prework is None or not self.local_work:
+            return None
+        try:
+            return self.prework.get(root_hex, _prework.threshold_for(subtype))
+        except Exception:                                   # pragma: no cover - defensive
+            return None
 
     def _local_work(self, root_hex: str, subtype: str = None) -> str:
         refused = NodeError(
@@ -328,6 +368,19 @@ class HttpNanoNode(NanoNode):
         if not block_hash:
             raise NodeError("publish_failed",
                             "the node at %s accepted no block" % host_of(self.url))
+        # This block is the account's new frontier, so it is the root of the
+        # account's NEXT block - and the next one may be a send, whose work
+        # no public node will do. Recording it here is what gives
+        # `nano-wallet work precompute` something to work on while nothing is
+        # waiting on it. A hint only: it cannot fail the publish.
+        if self.prework is not None:
+            try:
+                self.prework.want(block_hash)
+            except Exception:                               # pragma: no cover - defensive
+                # The block is on the network. Whatever went wrong filing a
+                # hint, the caller must be told the payment went out, not
+                # handed an exception that reads like a failed publish.
+                pass
         return block_hash
 
     def block_info(self, block_hash: str) -> dict:

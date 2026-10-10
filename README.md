@@ -139,7 +139,8 @@ and publish.
 * Local work is found **only for a receive or an open block**. Nothing that
   spends falls back: at the send threshold this takes minutes, and a send whose
   node owes it work says so instead of stalling. Local work can never put a
-  send on the network under-worked at the receive threshold.
+  send on the network under-worked at the receive threshold. A send gets work
+  without a node the other way - before the payment, not during it: see below.
 * Measured here at about 1.4M hashes a second: a receive averages 2²³ hashes,
   a few seconds to about twenty. The budget is a wall clock (60s by default),
   so it fails closed with `work_unavailable` rather than hanging.
@@ -150,6 +151,62 @@ the Nano mainnet — `BCE621224274F7DCB1B9BFB212CF9E5CADC50B47E8BEA5C2E4ED0F0635
 whose work the live network accepted. Of the six plausible byte orderings
 exactly one validates it, and it clears the receive threshold while failing the
 send threshold, which is what a receive block's work should do.
+
+## Sending with no node: find the work before the payment
+
+A send needs 64x a receive's work and no free public node answers
+`work_generate`, so a funded wallet can still be unable to spend. Nothing about
+that threshold needs the payment to be waiting, though. **Work is computed over
+the account's frontier and nothing else** - not the amount, not the
+destination, not the signature - and the frontier is fixed the moment the
+account's last block confirms, which is normally long before the next payment
+is asked for. So do the work then:
+
+```
+$ export NANO_WALLET_WORK_CACHE=~/.nano-wallet/work
+
+$ python3 cli.py work estimate
+{ "hashes_per_second": 1581234, "workers": 4,
+  "send": { "expected_hashes": 536870912, "average_seconds": 84.9 }, ... }
+
+$ python3 cli.py work pending            # the hash of the block it last published
+{ "pending": ["C1B2..."], "have_work_for": [] }
+
+$ python3 cli.py work precompute         # every core, now, while nothing waits
+{ "precomputed": "C1B2...", "work": "0ba27e49039735a0", "seconds": 136.988,
+  "difficulty": "0xffffffff9538c8f0", "covers_send": true, "workers": 4 }
+```
+
+The send that comes later reads that file in microseconds and **asks no node
+for work at all**. Measured on a 4-core 2.1GHz Xeon: 1.6M hashes a second a
+core, a send averaging 2²⁹ hashes - 137 seconds of wall clock and 9m01s of CPU
+for the vector above, against about 500 seconds on one core.
+
+* **It is off unless you set `NANO_WALLET_WORK_CACHE`.** With the variable
+  unset there is no cache, nothing is read, nothing is written, and the send
+  path is byte for byte what it was before this existed.
+* **Cached work is verified on the way out, against the root the caller asked
+  about** - not against what the file says it is for. A corrupted, edited or
+  foreign entry is a cache MISS, so an untrusted cache directory can cost you a
+  cache hit and can never put a bad block on the network.
+* **One entry serves every subtype.** `precompute` works at the send threshold
+  by default, and the send threshold is the higher number, so that same work is
+  valid for a receive too. Work that only covers a receive is never offered for
+  a send.
+* An average is not a bound. The search is memoryless: about one in twenty
+  takes three times the figure above. `--budget` is a wall clock and
+  `work_unavailable` is what you get when it runs out - nothing is stored and
+  the wallet is where it was.
+* `nano-wallet work ...` touches no key and no node, so an operator can measure
+  all of this on a wallet that holds nothing.
+* `local_work=False` on `HttpNanoNode` turns the cache off too. That switch says
+  this wallet does no proof-of-work of its own, and work out of the cache is
+  work this wallet did - just earlier.
+
+This is the remaining half of what an agent needs to pay with no node of its
+own; the receive half is the section above. What it does not do is make a send
+cheap: it moves the cost to a moment when nothing is waiting on it, which is
+the difference between an agent that can pay and one that cannot.
 
 ## The receive-only profile
 
@@ -268,10 +325,10 @@ of any mandate.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 210 tests — OK
+Ran 276 tests — OK
 
 $ python3 e2e_check.py
-15/15 checks passed
+19/19 checks passed
 
 $ python3 e2e_receive_only.py
 16/16 receive-only end-to-end checks passed
@@ -307,8 +364,10 @@ because that involves no third party. Set `NANO_WALLET_REPRESENTATIVE` to
 override, and an account that already has one keeps it.
 
 It does not run a node. `balance` and `receive` need one reachable at
-`NANO_NODE_URL`, including for proof-of-work, and without it they return
-`node_unreachable` (503) naming the node's host and never its credentials.
+`NANO_NODE_URL`, and without it they return `node_unreachable` (503) naming the
+node's host and never its credentials. It no longer needs that node to generate
+proof-of-work: a receive's work is found inline and a send's is found ahead of
+time (above), but the block still has to be published by somebody's node.
 
 It does not send anything under `--profile receive-only`, and under the full
 profile it will not send without `NANO_WALLET_ALLOW_SEND=1`, above
