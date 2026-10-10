@@ -268,7 +268,7 @@ of any mandate.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 192 tests — OK
+Ran 201 tests — OK
 
 $ python3 e2e_check.py
 15/15 checks passed
@@ -325,7 +325,11 @@ it would have gone and is confirmed, so it can never land and nothing was paid
 (`send_did_not_land`, 409 - retry under a new key). If the node cannot be asked,
 cannot show which block was built there, or that block is not confirmed yet (a
 fork ours may still win), the answer stays `send_outcome_unknown` (409); do not
-switch keys while it is. A send the operator mandate refused leaves nothing for a
+switch keys while it is. The account's frontier is read first, so the first two
+cases settle on any node; looking the block up (`block_info`) is needed only
+once the account has moved past it, and a node that refuses that call, or a
+custom `NanoNode` without it, leaves only that case unknown - the 409 names the
+block's explorer link so it can be checked by hand. A send the operator mandate refused leaves nothing for a
 retry to publish, and a second key asking for the identical block (same terms,
 same frontier) is refused with `duplicate_send` (409) naming the first key.
 A block the node rejects as invalid (bad work, bad signature, a balance that does

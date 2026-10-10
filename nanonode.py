@@ -104,7 +104,13 @@ class NanoNode:
         """`{"account","confirmed"}` for a block on the ledger, or `{}` when this
         node does not have it, plus `previous` (the block it builds on) and
         `successor` (the block built on it) when the node reports them. Used
-        only to settle a send whose reply was lost."""
+        only to settle a send whose reply was lost.
+
+        `confirmed` must be a bool: the wallet reads only `True` as confirmed,
+        so pass the RPC's "true"/"false" strings through as bools, not as text.
+        A subclass that does not implement this keeps working; a send whose
+        reply was lost and whose account has since moved on then stays
+        `send_outcome_unknown` instead of being settled."""
         raise NotImplementedError
 
 
@@ -188,7 +194,11 @@ class HttpNanoNode(NanoNode):
             # answer ("not here"), not a failure to reach the node.
             if payload.get("action") == "block_info" and answer["error"] == "Block not found":
                 return {}
-            if payload.get("action") == "process" and is_rejection(answer["error"]):
+            # Only for a send: that is the one block whose record a rejection
+            # frees. A receive or an open the node refuses stays a node_error,
+            # as it always was.
+            if (payload.get("action") == "process" and payload.get("subtype") == "send"
+                    and is_rejection(answer["error"])):
                 raise NodeError("block_rejected", "the Nano node at %s rejected the block: %s"
                                 % (host_of(self.url), answer["error"]))
             raise NodeError("node_error", "the Nano node at %s returned: %s"

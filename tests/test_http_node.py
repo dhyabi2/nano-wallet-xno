@@ -121,6 +121,16 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
             self.assertEqual(caught.exception.reason, "block_rejected", error)
             self.assertIn(error, caught.exception.message)
 
+    def test_a_rejected_receive_or_open_is_still_a_node_error(self):
+        # Only a send's record is freed by a rejection; a receive or an open
+        # the node refuses answers as it did before: node_error.
+        for subtype in ("receive", "open"):
+            node, _ = self._node({"error": "Bad signature"})
+            with self.assertRaises(nanonode.NodeError) as caught:
+                node.process({"type": "state", "_subtype": subtype})
+            self.assertEqual(caught.exception.reason, "node_error", subtype)
+            self.assertIn("Bad signature", caught.exception.message)
+
     def test_an_answer_that_says_nothing_about_the_block_itself_is_not_a_rejection(self):
         # "Old block" means it IS on the ledger; "Fork" means it is in an
         # election it may still win; a gap means the node may apply it once the

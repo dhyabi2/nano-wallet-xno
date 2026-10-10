@@ -158,12 +158,13 @@ class AnUnknownSendIsSettledFromTheLedger(unittest.TestCase):
 
     def test_when_the_lookup_fails_the_outcome_stays_unknown(self):
         self.first_attempt_fails("lose_reply")
+        self.send(key="k2", amount="0.5")   # the frontier alone can no longer say
         self.node.lookups_fail = True
         with self.assertRaises(payments.ToolError) as caught:
             self.send()
         self.assertEqual(caught.exception.reason, "send_outcome_unknown")
         self.assertIn(self.sent["k1"]["block_hash"], caught.exception.message)
-        self.assertEqual(len(self.sends_applied()), 1)
+        self.assertEqual(len(self.sends_applied()), 2)
 
     def test_a_rebroadcast_that_fails_again_stays_unknown(self):
         self.first_attempt_fails("drop")
@@ -568,3 +569,123 @@ class AMandateRefusalLeavesNothingToRebroadcast(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheFrontierSettlesWhatItCanWithoutBlockInfo(unittest.TestCase):
+    """`account_info` is read before `block_info`. A node that refuses
+    `block_info` (a restricted proxy) or a NanoNode subclass that predates it
+    still settles a send whose frontier says what happened; only a send whose
+    account has moved on needs the lookup, and without it stays unknown - as a
+    clean 409, never an exception."""
+
+    setUp = AnUnknownSendIsSettledFromTheLedger.setUp
+    send = AnUnknownSendIsSettledFromTheLedger.send
+    first_attempt_fails = AnUnknownSendIsSettledFromTheLedger.first_attempt_fails
+    sends_applied = AnUnknownSendIsSettledFromTheLedger.sends_applied
+    balance = AnUnknownSendIsSettledFromTheLedger.balance
+
+    def refuse_block_info(self):
+        def refused(block_hash):
+            self.node.calls.append("block_info")
+            raise nanonode.NodeError("node_error", "Action not allowed")
+        self.node.block_info = refused
+
+    def drop_block_info(self):
+        # The base class's method: what a subclass that never wrote one has.
+        self.node.block_info = lambda block_hash: nanonode.NanoNode.block_info(
+            self.node, block_hash)
+
+    def test_a_publish_that_never_landed_is_rebroadcast_without_block_info(self):
+        self.first_attempt_fails("drop")
+        self.refuse_block_info()
+        signed_hash = self.sent["k1"]["block_hash"]
+        out = self.send()
+        self.assertEqual(out["reconciled"], "rebroadcast")
+        self.assertEqual(out["block_hash"], signed_hash)
+        self.assertEqual(self.balance(), 9 * RAW, "paid exactly once")
+        self.assertEqual(self.send()["block_hash"], signed_hash, "settled: a plain replay")
+        self.assertEqual(len(self.sends_applied()), 1)
+
+    def test_it_is_not_stuck_between_unknown_and_duplicate(self):
+        # Before: same key -> send_outcome_unknown, new key on the same terms
+        # -> duplicate_send, for as long as the process lived.
+        self.first_attempt_fails("drop")
+        self.refuse_block_info()
+        self.assertEqual(self.send()["reconciled"], "rebroadcast")
+        other = self.send(key="k2")          # a deliberate second payment
+        self.assertNotEqual(other["block_hash"], self.sent["k1"]["block_hash"])
+        self.assertEqual(self.balance(), 8 * RAW)
+
+    def test_a_landed_frontier_is_the_payment_without_block_info(self):
+        self.first_attempt_fails("lose_reply")
+        self.refuse_block_info()
+        landed = fakenode._hash_of(self.sends_applied()[0])
+        out = self.send()
+        self.assertEqual(out["reconciled"], "landed")
+        self.assertEqual(out["block_hash"], landed)
+        self.assertFalse(out["confirmed"], "the node could not say, so not claimed")
+        self.assertEqual(len(self.sends_applied()), 1)
+
+    def test_a_subclass_without_block_info_settles_by_frontier(self):
+        self.drop_block_info()
+        self.first_attempt_fails("lose_reply")
+        out = self.send()
+        self.assertEqual(out["reconciled"], "landed")
+        self.assertEqual(len(self.sends_applied()), 1)
+
+    def test_a_subclass_without_block_info_rebroadcasts_by_frontier(self):
+        self.drop_block_info()
+        self.first_attempt_fails("drop")
+        self.assertEqual(self.send()["reconciled"], "rebroadcast")
+        self.assertEqual(self.balance(), 9 * RAW)
+
+    def test_a_subclass_without_block_info_is_unknown_once_the_account_moved(self):
+        self.drop_block_info()
+        self.first_attempt_fails("drop")
+        self.send(key="k2", amount="0.5")
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn("block_info", caught.exception.message)
+        self.assertIsNone(self.sent["k1"]["result"], "still held")
+        self.assertEqual(len(self.sends_applied()), 1, "nothing republished")
+
+    def test_the_unknown_answer_says_what_will_settle_it(self):
+        self.first_attempt_fails("drop")
+        self.send(key="k2", amount="0.5")
+        self.refuse_block_info()
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        message = caught.exception.message
+        block_hash = self.sent["k1"]["block_hash"]
+        self.assertIn("https://nanolooker.com/block/%s" % block_hash, message)
+        self.assertIn("send_did_not_land", message)
+        self.assertIn(self.sent["k1"]["previous"], message)
+        self.assertIn("Do not switch to a NEW idempotency_key", message)
+
+
+class AnOccupantIsConfirmedOnlyByTrue(unittest.TestCase):
+    """A custom node that passes the RPC's string "false" through as
+    `confirmed` must not turn an unconfirmed fork into `send_did_not_land`
+    (which tells the agent to pay again under a new key)."""
+
+    setUp = AnUnknownSendIsSettledFromTheLedger.setUp
+    send = AnUnknownSendIsSettledFromTheLedger.send
+    first_attempt_fails = AnUnknownSendIsSettledFromTheLedger.first_attempt_fails
+
+    def test_the_string_false_is_not_confirmed(self):
+        self.first_attempt_fails("drop")
+        self.send(key="k2", amount="0.5")
+        real = self.node.block_info
+
+        def stringly(block_hash):
+            found = real(block_hash)
+            if found:
+                found["confirmed"] = "false"
+            return found
+        self.node.block_info = stringly
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send()
+        self.assertEqual(caught.exception.reason, "send_outcome_unknown")
+        self.assertIsNone(self.sent["k1"]["result"])

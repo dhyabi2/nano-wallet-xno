@@ -429,15 +429,23 @@ def _rejected(sent: dict, idempotency_key: str, record: dict, exc) -> ToolError:
 
 
 def _unknown(idempotency_key: str, record: dict, why: str) -> ToolError:
+    block_hash = record.get("block_hash") or "(unknown)"
     return ToolError(
         "send_outcome_unknown",
         "idempotency_key %r already broadcast a send of %s XNO to %s as block %s, "
         "and the node's reply did not arrive, so it is not known whether it "
-        "landed (%s). Nothing new was signed. Retry this same call to look it up "
-        "again. Do not switch to a NEW idempotency_key while this is unknown: "
+        "landed (%s). Nothing new was signed. Retrying this same call settles it "
+        "as soon as the node can answer: it returns the payment once block %s is on "
+        "the ledger, publishes that same block again if the account has not moved "
+        "past the block it builds on (%s), and answers send_did_not_land - after "
+        "which a NEW idempotency_key is safe - once a confirmed block holds its slot. "
+        "If this node cannot look blocks up (block_info refused or not provided), "
+        "point the wallet at a node that can, or check "
+        "https://nanolooker.com/block/%s yourself: if the block is there, the payment "
+        "is made. Do not switch to a NEW idempotency_key while this is unknown: "
         "that would build a second send and may pay twice."
-        % (idempotency_key, _six(record["amount_raw"]), record["to"],
-           record.get("block_hash") or "(unknown)", why),
+        % (idempotency_key, _six(record["amount_raw"]), record["to"], block_hash, why,
+           block_hash, record.get("previous") or "(not recorded)", block_hash),
         409,
     )
 
@@ -455,6 +463,9 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
         `previous`: the slot it named is taken and it can never land - retry
         under a new key. An occupant that is not confirmed yet is a fork ours
         may still win, so that stays unknown.
+    The frontier is read first and settles the first two cases on its own;
+    `block_info` is needed only once the account has moved past `previous`, and
+    a node that refuses it or does not provide it leaves that case unknown.
     A lookup that fails leaves it unknown. Absence from the ledger alone is
     never read as "never sent"; only a slot taken for good is. A rebroadcast
     the node rejects as an invalid block frees the key (`send_rejected`).
@@ -470,39 +481,48 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
     if holder is not None:
         raise _duplicate(idempotency_key, holder, block_hash)
     try:
-        found = node.block_info(block_hash)
-        if found:
-            outcome = "landed"
-            confirmed = bool(found.get("confirmed"))
+        # The account's frontier first: it alone settles the two commonest
+        # cases, and `account_info` is a call every node answers, where
+        # `block_info` may be refused by a restricted proxy or missing from a
+        # custom NanoNode written against the five-call surface.
+        frontier = (node.account_info(source).get("frontier") or "").upper()
+        previous = (record.get("previous") or "").upper()
+        if frontier == block_hash:
+            outcome, confirmed = "landed", _confirmed_if_known(node, block_hash)
+        elif previous and frontier == previous and record.get("block"):
+            # Nothing is built on `previous` on this ledger, so ours is not on
+            # it. Publishing the SAME signed block again is one hash, so it can
+            # only ever be one payment, whether or not it already landed
+            # elsewhere.
+            try:
+                node.process(dict(record["block"]))
+            except nanonode.NodeError as exc:
+                if exc.reason == "block_rejected":
+                    raise _rejected(sent, idempotency_key, record, exc) from None
+                raise
+            outcome, confirmed = "rebroadcast", False
         else:
-            if not record.get("previous") or not record.get("block"):
+            # The account moved on. That alone does not say our block lost its
+            # slot: it may sit under the blocks that came after it. Only the
+            # ledger can say, so from here `block_info` is needed.
+            found = node.block_info(block_hash)
+            if found:
+                outcome = "landed"
+                confirmed = found.get("confirmed") is True
+            elif not previous or not record.get("block"):
                 raise _unknown(idempotency_key, record,
                                "the block is not on this node and this record cannot "
                                "tell whether it still can be")
-            previous = record["previous"].upper()
-            frontier = (node.account_info(source).get("frontier") or "").upper()
-            if frontier == block_hash:
-                outcome, confirmed = "landed", False
-            elif frontier == previous:
-                try:
-                    node.process(dict(record["block"]))
-                except nanonode.NodeError as exc:
-                    if exc.reason == "block_rejected":
-                        raise _rejected(sent, idempotency_key, record, exc) from None
-                    raise
-                outcome, confirmed = "rebroadcast", False
             else:
-                # The account moved on. That alone does not say our block lost
-                # its slot: it may sit under the blocks that came after it, on
-                # a node that does not answer for it. Only the block actually
-                # built on `previous` says which.
                 occupant = _slot_occupant(node, previous, frontier, block_hash)
                 if occupant is None:
                     raise _unknown(idempotency_key, record,
                                    "the block is not on this node, the account has moved "
                                    "on to %s, and the node could not show which block "
                                    "was built on %s" % (frontier or "(none)", previous))
-                if occupant != block_hash and not (node.block_info(occupant) or {}).get("confirmed"):
+                # `is True`, not truthiness: a node passing the RPC's string
+                # "false" through must not read as a confirmed occupant.
+                if occupant != block_hash and (node.block_info(occupant) or {}).get("confirmed") is not True:
                     # Two blocks on one `previous` are a fork until the network
                     # confirms one of them, and ours can still win it. Saying
                     # "did not land" now tells the agent to pay again under a
@@ -526,6 +546,11 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
                 outcome, confirmed = "landed", False
     except nanonode.NodeError as exc:
         raise _unknown(idempotency_key, record, exc.message) from None
+    except NotImplementedError:
+        # A NanoNode subclass written before `block_info` joined the surface.
+        raise _unknown(idempotency_key, record,
+                       "this node does not provide block_info, which is needed once "
+                       "the account has moved past the block it builds on") from None
 
     result = {
         "block_hash": block_hash,
@@ -537,6 +562,14 @@ def _settle_unknown_send(source: str, idempotency_key: str, record: dict,
     sent[idempotency_key] = {"to": record["to"], "amount_raw": record["amount_raw"],
                              "result": result, "block_hash": block_hash}
     return dict(result, replayed=True, reconciled=outcome)
+
+
+def _confirmed_if_known(node: nanonode.NanoNode, block_hash: str) -> bool:
+    """Whether the node calls this block confirmed; False when it cannot say."""
+    try:
+        return (node.block_info(block_hash) or {}).get("confirmed") is True
+    except (nanonode.NodeError, NotImplementedError):
+        return False
 
 
 # How far back from the frontier a settle will read the chain to find which

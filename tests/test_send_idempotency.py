@@ -91,13 +91,17 @@ class ABroadcastWhoseReplyWasLost(unittest.TestCase):
         with self.assertRaises(payments.ToolError):
             self.send()
         published = self.sends_published()[0]
+        # The account moves past it, so the frontier alone cannot settle it
+        # and the block has to be looked up - and the lookup fails.
+        self.node.lose_replies = False
+        self.send(amount="0.5", key="another-key")
         self.node.lookups_fail = True
         with self.assertRaises(payments.ToolError) as caught:
             self.send()
         self.assertEqual(caught.exception.reason, "send_outcome_unknown")
         self.assertEqual(caught.exception.status, 409)
         self.assertIn(fakenode._hash_of(published), caught.exception.message)
-        self.assertEqual(len(self.sends_published()), 1)
+        self.assertEqual(len(self.sends_published()), 2)
 
     def test_a_third_attempt_pays_nothing_more(self):
         with self.assertRaises(payments.ToolError):
