@@ -174,14 +174,16 @@ def receive(address: str, node: nanonode.NanoNode, keys: _keystore.KeyStore,
         pending = node.receivable(address, max_blocks)
         info = node.account_info(address)
         # This pairs the node's balance with the node's frontier the same way
-        # `send` does, and deliberately carries no `balance_is_frontier_balance`
-        # refusal, because a receive built on a mixed pair fails closed at the
-        # node instead of moving XNO. Nano checks a receive's balance increase
+        # `send` does. `HttpNanoNode.account_info` reads both from the account's
+        # tip, so they always belong together; another `NanoNode` might not. This
+        # path deliberately carries no `balance_is_frontier_balance` refusal,
+        # because a receive built on a mixed pair fails closed at the node
+        # instead of moving XNO. Nano checks a receive's balance increase
         # against the linked block's amount and checks the declared subtype
-        # against the direction of the change - so a balance taken one block
-        # early either understates the increase or turns the block into a send,
-        # and `process` is told `subtype: receive` either way, so the node
-        # rejects it. A send has no such check: its amount IS the balance
+        # against the direction of the change - so a balance that does not
+        # belong to the frontier either misstates the increase or turns the
+        # block into a send, and `process` is told `subtype: receive` either
+        # way, so the node rejects it. A send has no such check: its amount IS the balance
         # difference, whatever that difference turns out to be, which is why
         # the refusal lives on that path alone. If `process` ever stops sending
         # the subtype (pinned by a test), this comment stops being true.
@@ -316,16 +318,20 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
         info = node.account_info(source)
         # Nano reads a send's amount as previous.balance - block.balance, and
         # `previous` below is this account's frontier. So the balance subtracted
-        # from has to be the balance AT that frontier. When the node reports a
-        # balance taken at the confirmation height while the frontier is further
-        # along - the ordinary state for a second or two after this wallet
-        # publishes a block of its own - the gap between the two is paid out of
-        # the account on top of the payment: a 1 XNO send out of a tip holding
-        # 6 XNO against a confirmed 5 builds balance = 4 and moves 2 XNO. On a
-        # feeless, sub-second, irreversible rail there is nothing to undo that
-        # with, so refuse while the two disagree rather than pick one for the
-        # caller. Which of the two a send should be built on is open in #4; this
-        # refuses the only state in which the choice can cost money.
+        # from has to be the balance AT that frontier. A balance taken at the
+        # confirmation height while the frontier is further along - the
+        # ordinary state for a second or two after this wallet publishes a
+        # block of its own - pays the gap out of the account on top of the
+        # payment: a 1 XNO send out of a tip holding 6 XNO against a confirmed
+        # 5 builds balance = 4 and moves 2 XNO.
+        #
+        # `HttpNanoNode.account_info` now reads the frontier and the balance
+        # from the tip as one pair (#4), so it always reports
+        # `balance_is_frontier_balance` true and this refusal cannot be reached
+        # through it. It stays as a guard for other `NanoNode` implementations,
+        # and for any later change that reintroduces a mixed pair: on a
+        # feeless, sub-second, irreversible rail there is nothing to undo an
+        # overpayment with, so refuse rather than pay the gap.
         if info.get("frontier") and not info.get("balance_is_frontier_balance", True):
             raise ToolError(
                 "account_state_unsettled",

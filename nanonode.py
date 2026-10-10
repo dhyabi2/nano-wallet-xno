@@ -212,30 +212,46 @@ class HttpNanoNode(NanoNode):
         })
         if not answer.get("frontier"):
             return {}
-        confirmed_balance = answer.get("confirmed_balance")
+        # `frontier` and `balance` are the account's TIP. `confirmed_frontier`
+        # and `confirmed_balance` are the account at its confirmation height.
+        # They differ whenever a block of ours has not been confirmed yet -
+        # for the second or two after we publish a receive, say.
+        #
+        # They must be read as a PAIR. This returned the tip's frontier beside
+        # the CONFIRMED balance, and `blocks.build_signed` uses the frontier as
+        # `previous` and the balance to compute the new one. Nano reads the
+        # amount of a send as `previous.balance - block.balance`, so the
+        # mismatch is paid out of the account: receive 1 XNO, then send 1 XNO
+        # before that receive confirms, and previous.balance is 6 XNO while the
+        # block says 5 - 1 = 4, so 2 XNO leaves. The agent asked to send 1.
+        #
+        # The tip is the pair to use. `previous` has to BE the account's tip or
+        # the block forks our own chain, and the unconfirmed part of the tip is
+        # our own just-published blocks: `receivable` below asks for
+        # `include_only_confirmed`, so we only ever receive sends the network
+        # has already confirmed. `confirmed` now says whether the tip itself is
+        # confirmed, which is the question a caller was asking all along - it
+        # used to be `confirmed_height is not None`, true for every opened
+        # account, including this one - and it fails closed: see
+        # `_tip_is_confirmed`.
+        frontier = answer["frontier"]
         return {
-            "frontier": answer["frontier"],
-            "balance_raw": int(answer["balance"] if confirmed_balance is None
-                               else confirmed_balance),
-            "representative": answer.get("confirmed_representative", answer.get("representative")),
+            "frontier": frontier,
+            "balance_raw": int(answer["balance"]),
+            "representative": answer.get("representative"),
             "block_count": int(answer.get("block_count", 0)),
-            "confirmed": answer.get("confirmed_height") is not None,
-            # Does `balance_raw` belong to `frontier`? `frontier`/`balance`
-            # describe the account's tip; `confirmed_frontier`/`confirmed_balance`
-            # describe it at its confirmation height. They are the same point on
-            # the chain only while the tip is confirmed, and this answer takes the
-            # frontier from one and the balance from the other - so say which it
-            # is, because Nano reads a send's amount as the difference between
-            # two balances and `payments.send` pairs them. Reported here rather
-            # than repaired: which of the two a wallet should build on is a
-            # judgement about a chain it is extending, not about reading JSON
-            # (dhyabi2/nano-wallet-xno#4). Unprovable counts as False: a node
-            # that sends a confirmed balance and no confirmed frontier has not
-            # told us the two match.
-            "balance_is_frontier_balance": (
-                confirmed_balance is None
-                or answer.get("confirmed_frontier") == answer["frontier"]
-            ),
+            "confirmed": _tip_is_confirmed(answer, frontier),
+            # #10 added this flag and a `send` refusal for the state this pull
+            # request removes: the frontier and the balance used to come from two
+            # different moments, so `send` refused while they disagreed rather
+            # than paying the gap out of the account. With the tip read as a pair
+            # above, `balance_raw` IS the balance at `frontier`, always - so the
+            # flag is unconditionally true and #10's refusal goes quiet. It is
+            # reported, and the refusal is kept, deliberately: a later change
+            # that reintroduces a mixed pair meets the refusal again instead of
+            # silently overpaying. This is the resolution #10's own commit
+            # message asked for.
+            "balance_is_frontier_balance": True,
         }
 
     def receivable(self, address: str, count: int) -> list:
@@ -329,6 +345,36 @@ class HttpNanoNode(NanoNode):
         if _is_hash(successor) and successor.strip("0"):
             found["successor"] = successor.upper()
         return found
+
+
+def _tip_is_confirmed(answer: dict, frontier: str) -> bool:
+    """Whether the network has confirmed the account's latest block.
+
+    Fails closed: True only when the node's answer shows it. The confirmed
+    frontier is compared first (`confirmed_frontier`, then the older
+    `confirmation_height_frontier`), case-insensitively, since hex from a node
+    is not promised to be upper case. Without either, the heights: Nano numbers
+    an account's blocks from 1 (the open block), so the tip's height IS
+    `block_count`, and the tip is confirmed exactly when the confirmation height
+    has reached it. `confirmed_height` comes with include_confirmed and
+    `confirmation_height` without it; they are the same number. A node that
+    says neither has not told us the tip is confirmed, so it is not reported as
+    though it were.
+    """
+    confirmed_frontier = answer.get("confirmed_frontier") or \
+        answer.get("confirmation_height_frontier")
+    if confirmed_frontier:
+        return str(confirmed_frontier).upper() == str(frontier).upper()
+    height = answer.get("confirmed_height")
+    if height is None:
+        height = answer.get("confirmation_height")
+    count = answer.get("block_count")
+    if height is None or count is None:
+        return False
+    try:
+        return int(count) > 0 and int(height) == int(count)
+    except (TypeError, ValueError):
+        return False
 
 
 def _is_hash(value) -> bool:
