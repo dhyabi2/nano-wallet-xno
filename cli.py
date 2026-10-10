@@ -134,7 +134,11 @@ def _work_command(args) -> int:
         if problem:
             return _out(problem, 2)
         return _out({"cache": cache.directory, "pending": cache.pending(),
-                     "have_work_for": cache.roots()})
+                     # Only roots whose work a SEND can use: work at the
+                     # receive threshold alone does not make an account able
+                     # to pay, so listing it here would overstate the cache.
+                     "have_work_for": [root for root in cache.roots()
+                                       if cache.has(root, _work.SEND_THRESHOLD)]})
 
     if sub == "precompute":
         cache, problem = _work_cache(rest)
@@ -154,6 +158,8 @@ def _work_command(args) -> int:
                 threshold=names[asked],
                 budget_seconds=_flag(rest, "budget", float),
                 workers=_flag(rest, "workers", int))
+        except prework.CacheUnwritable as exc:
+            return _out({"error": "cache_unwritable", "message": str(exc)}, 2)
         except prework.CacheError as exc:
             return _out({"error": "bad_root", "message": str(exc)}, 2)
         except _work.WorkUnavailable as exc:

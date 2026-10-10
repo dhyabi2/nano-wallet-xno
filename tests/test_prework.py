@@ -572,5 +572,117 @@ class WhichThresholdASubtypeNeeds(unittest.TestCase):
             self.assertEqual(prework.threshold_for(subtype), work.SEND_THRESHOLD, subtype)
 
 
+class WorkIsExactlySixteenHexCharacters(_CacheCase):
+    """`bytes.fromhex` accepts surrounding whitespace; a node does not."""
+
+    PADDED = " " + SEND_WORK + " "
+
+    def test_padded_work_is_refused_rather_than_stored(self):
+        for bad in (self.PADDED, SEND_WORK + "\n", "\t" + SEND_WORK, "0x" + SEND_WORK[2:]):
+            with self.assertRaises(prework.CacheError, msg=repr(bad)):
+                self.cache.put(REAL_ROOT_HEX, bad)
+        self.assertFalse(self.cache.has(REAL_ROOT_HEX))
+
+    def test_padded_work_written_by_another_process_is_a_miss(self):
+        with open(self.cache.path_for(REAL_ROOT_HEX), "w") as handle:
+            json.dump({"work": self.PADDED}, handle)
+        self.assertIsNone(self.cache.get(REAL_ROOT_HEX, work.SEND_THRESHOLD))
+
+    def test_upper_case_work_is_stored_and_returned_lower_case(self):
+        entry = self.cache.put(REAL_ROOT_HEX, SEND_WORK.upper())
+        self.assertEqual(entry["work"], SEND_WORK)
+        with open(self.cache.path_for(REAL_ROOT_HEX), "w") as handle:
+            json.dump({"work": SEND_WORK.upper()}, handle)
+        self.assertEqual(self.cache.get(REAL_ROOT_HEX, work.SEND_THRESHOLD), SEND_WORK)
+
+
+class AFileThatIsNotAnEntryCannotHangTheRead(_CacheCase):
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_a_fifo_in_place_of_an_entry_is_a_fast_miss(self):
+        os.mkfifo(self.cache.path_for(REAL_ROOT_HEX))
+        os.mkfifo(os.path.join(self.directory, prework.PENDING_FILE))
+        import time as _time
+        started = _time.monotonic()
+        self.assertIsNone(self.cache.get(REAL_ROOT_HEX, work.SEND_THRESHOLD))
+        self.assertEqual(self.cache.pending(), [])
+        self.assertLess(_time.monotonic() - started, 2.0)
+
+    @unittest.skipUnless(os.path.exists("/dev/zero") and hasattr(os, "symlink"),
+                         "no /dev/zero or symlinks here")
+    def test_a_symlink_to_dev_zero_is_a_miss(self):
+        os.symlink("/dev/zero", self.cache.path_for(REAL_ROOT_HEX))
+        self.assertIsNone(self.cache.get(REAL_ROOT_HEX, work.SEND_THRESHOLD))
+
+    def test_a_symlink_to_a_valid_entry_is_a_miss(self):
+        elsewhere = os.path.join(self.directory, "elsewhere")
+        with open(elsewhere, "w") as handle:
+            json.dump({"work": SEND_WORK}, handle)
+        os.symlink(elsewhere, self.cache.path_for(REAL_ROOT_HEX))
+        self.assertIsNone(self.cache.get(REAL_ROOT_HEX, work.SEND_THRESHOLD))
+
+    def test_an_oversized_file_is_a_miss(self):
+        with open(self.cache.path_for(REAL_ROOT_HEX), "w") as handle:
+            handle.write('{"work": "%s", "pad": "%s"}' % (SEND_WORK, "x" * 8192))
+        self.assertIsNone(self.cache.get(REAL_ROOT_HEX, work.SEND_THRESHOLD))
+
+
+class ACacheThatCannotBeWrittenFailsBeforeTheSearch(unittest.TestCase):
+    def setUp(self):
+        parent = tempfile.mkdtemp(prefix="prework-test-")
+        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        # A directory under a regular FILE cannot be created, even by root,
+        # which is what this suite may be running as.
+        blocker = os.path.join(parent, "a-file")
+        open(blocker, "w").close()
+        self.cache = prework.WorkCache(os.path.join(blocker, "cache"))
+
+    def test_no_cpu_is_spent_and_the_error_is_named(self):
+        with mock.patch.object(work, "solve_parallel") as search:
+            with self.assertRaises(prework.CacheUnwritable):
+                self.cache.precompute(REAL_ROOT_HEX, threshold=work.RECEIVE_THRESHOLD)
+        search.assert_not_called()
+
+    def test_a_put_raises_cache_unwritable_not_oserror(self):
+        with self.assertRaises(prework.CacheUnwritable):
+            self.cache.put(REAL_ROOT_HEX, SEND_WORK)
+
+    def test_the_cli_names_it_cache_unwritable_not_bad_root(self):
+        import cli
+        out = io.StringIO()
+        with mock.patch.object(work, "solve_parallel") as search, \
+                mock.patch("sys.stdout", out):
+            code = cli.main(["work", "precompute", REAL_ROOT_HEX,
+                             "--cache", self.cache.directory])
+        search.assert_not_called()
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out.getvalue())["error"], "cache_unwritable")
+
+
+class PendingListsOnlyWorkASendCanUse(_CacheCase):
+    def test_receive_grade_work_is_not_listed_as_held(self):
+        import cli
+        self.cache.put(REAL_ROOT_HEX, RECEIVE_WORK)
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            self.assertEqual(cli.main(["work", "pending", "--cache", self.directory]), 0)
+        self.assertEqual(json.loads(out.getvalue())["have_work_for"], [])
+        self.cache.put(REAL_ROOT_HEX, SEND_WORK)
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            cli.main(["work", "pending", "--cache", self.directory])
+        self.assertEqual(json.loads(out.getvalue())["have_work_for"], [REAL_ROOT_HEX])
+
+
+class TheServerTakesItsCacheFromItsOwnEnvironment(unittest.TestCase):
+    def test_env_given_to_the_server_decides_the_cache_not_os_environ(self):
+        import mcp_server
+        with mock.patch.dict(os.environ, {prework.CACHE_ENV: "/from/os/environ"}):
+            bare = mcp_server.Server(env={"NANO_NODE_URL": "https://node.example/rpc"})
+            self.assertIsNone(bare.node().prework)
+            given = mcp_server.Server(env={"NANO_NODE_URL": "https://node.example/rpc",
+                                           prework.CACHE_ENV: "/from/server/env"})
+            self.assertEqual(given.node().prework.directory, "/from/server/env")
+
+
 if __name__ == "__main__":
     unittest.main()

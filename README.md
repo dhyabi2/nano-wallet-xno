@@ -192,7 +192,12 @@ for the vector above, against about 500 seconds on one core.
 * **One entry serves every subtype.** `precompute` works at the send threshold
   by default, and the send threshold is the higher number, so that same work is
   valid for a receive too. Work that only covers a receive is never offered for
-  a send.
+  a send, and `work pending` does not list it under `have_work_for`.
+* **A cache file that is not an entry is a miss, never a hang.** Entries are
+  opened without following symlinks and without blocking, must be regular
+  files, and are read up to 4 KB; work must be exactly 16 hex characters. A
+  cache directory that cannot be written to fails `precompute` with
+  `cache_unwritable` before any CPU is spent.
 * An average is not a bound. The search is memoryless: about one in twenty
   takes three times the figure above. `--budget` is a wall clock and
   `work_unavailable` is what you get when it runs out - nothing is stored and
@@ -325,10 +330,10 @@ of any mandate.
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 276 tests — OK
+Ran 288 tests — OK
 
 $ python3 e2e_check.py
-19/19 checks passed
+20/20 checks passed
 
 $ python3 e2e_receive_only.py
 16/16 receive-only end-to-end checks passed

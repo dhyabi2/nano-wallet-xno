@@ -149,7 +149,7 @@ def _():
     assert said["send"]["average_seconds"] > said["receive"]["average_seconds"]
 
 
-@check("`work precompute` stores verified work the next block can be sent with")
+@check("`work precompute` stores verified RECEIVE-threshold work, not listed as send-ready")
 def _():
     import tempfile
 
@@ -168,6 +168,30 @@ def _():
         held = prework.WorkCache(cache).get(WORK_ROOT, work.RECEIVE_THRESHOLD)
         assert held == said["work"], (held, said)
         assert work.validates(bytes.fromhex(WORK_ROOT), held, work.RECEIVE_THRESHOLD)
+        # Receive-grade work does not let the account send, so `pending` must
+        # not count it as held.
+        listed = subprocess.run([sys.executable, "cli.py", "work", "pending",
+                                 "--cache", cache], capture_output=True, text=True)
+        assert json.loads(listed.stdout)["have_work_for"] == [], listed.stdout
+
+
+@check("SEND-threshold work in the cache is listed, reused and read back by another process")
+def _():
+    import tempfile
+
+    import prework
+    import work
+    with tempfile.TemporaryDirectory() as cache:
+        # The pinned vector stands in for the minutes-long search.
+        prework.WorkCache(cache).put(WORK_ROOT, SEND_WORK)
+        run = subprocess.run([sys.executable, "cli.py", "work", "precompute",
+                              WORK_ROOT, "--cache", cache, "--budget", "5"],
+                             capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        said = json.loads(run.stdout)
+        assert said["already_had_it"] is True and said["work"] == SEND_WORK, said
+        held = prework.WorkCache(cache).get(WORK_ROOT, work.SEND_THRESHOLD)
+        assert held == SEND_WORK, held
         listed = subprocess.run([sys.executable, "cli.py", "work", "pending",
                                  "--cache", cache], capture_output=True, text=True)
         assert json.loads(listed.stdout)["have_work_for"] == [WORK_ROOT], listed.stdout

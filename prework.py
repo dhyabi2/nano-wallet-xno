@@ -43,6 +43,8 @@ whatever work it carries.
 
 import json
 import os
+import re
+import stat
 import tempfile
 import time
 
@@ -62,9 +64,26 @@ MAX_PENDING = 16
 
 PENDING_FILE = "pending.json"
 
+#: Bytes read from one cache file at most. An entry is about 200 bytes; a file
+#: larger than this is not one, and is a miss rather than something to load.
+MAX_FILE_BYTES = 4096
+
+#: Work exactly as a block carries it: 16 hex characters, nothing around them.
+#: `bytes.fromhex` alone accepts surrounding whitespace, and work that
+#: validates here but is published with that whitespace is rejected by every
+#: node.
+_WORK_RE = re.compile(r"\A[0-9a-fA-F]{16}\Z")
+
 
 class CacheError(Exception):
-    """The cache directory cannot be used (not the same thing as a miss)."""
+    """A root or work value is malformed, or the cache cannot be used.
+
+    Not the same thing as a miss.
+    """
+
+
+class CacheUnwritable(CacheError):
+    """The cache directory cannot be created or written to."""
 
 
 def _normalise_root(root_hex: str) -> str:
@@ -79,6 +98,43 @@ def _normalise_root(root_hex: str) -> str:
     except ValueError:
         raise CacheError("a root is 64 hex characters; %r is not hex" % root_hex) from None
     return text
+
+
+def _normalise_work(work_hex):
+    """The 16 lower-case hex characters a block carries, or None."""
+    if not isinstance(work_hex, str) or not _WORK_RE.match(work_hex):
+        return None
+    return work_hex.lower()
+
+
+def _read_small_json(path: str):
+    """A cache file's JSON, or None. Never blocks and never loads much.
+
+    Opened with O_NOFOLLOW (a symlink is a miss) and O_NONBLOCK (a FIFO
+    cannot hang the send path waiting for a writer), then required to be a
+    regular file, and read up to MAX_FILE_BYTES - so /dev/zero, a FIFO, a
+    device or an oversized file all cost a cache miss and nothing else.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+            return None
+        data = os.read(fd, MAX_FILE_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > MAX_FILE_BYTES:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def threshold_for(subtype: str) -> int:
@@ -127,15 +183,11 @@ class WorkCache(object):
             root = _normalise_root(root_hex)
         except CacheError:
             return None
-        try:
-            with open(self.path_for(root), encoding="utf-8") as handle:
-                entry = json.load(handle)
-        except (OSError, ValueError):
-            return None
+        entry = _read_small_json(self.path_for(root))
         if not isinstance(entry, dict):
             return None
-        found = entry.get("work")
-        if not isinstance(found, str):
+        found = _normalise_work(entry.get("work"))
+        if found is None:
             return None
         # The root is re-derived from the KEY, not read from the file: a file
         # claiming a root it is not named for must not be able to answer for
@@ -179,6 +231,10 @@ class WorkCache(object):
         is not a proof.
         """
         root = _normalise_root(root_hex)
+        work_hex_in = work_hex
+        work_hex = _normalise_work(work_hex)
+        if work_hex is None:
+            raise CacheError("work is exactly 16 hex characters, got %r" % (work_hex_in,))
         difficulty = _work.difficulty(bytes.fromhex(root), work_hex)
         if difficulty < _work.RECEIVE_THRESHOLD:
             raise CacheError(
@@ -235,11 +291,7 @@ class WorkCache(object):
         unable to pay with a full-looking cache. The file is pruned as a side
         effect of the next `want`, which rewrites it from this list.
         """
-        try:
-            with open(os.path.join(self.directory, PENDING_FILE), encoding="utf-8") as handle:
-                stored = json.load(handle)
-        except (OSError, ValueError):
-            return []
+        stored = _read_small_json(os.path.join(self.directory, PENDING_FILE))
         roots = stored.get("roots") if isinstance(stored, dict) else None
         if not isinstance(roots, list):
             return []
@@ -274,6 +326,9 @@ class WorkCache(object):
         existing = self.get(root, threshold)
         if existing is not None:
             return {"precomputed": root, "work": existing, "already_had_it": True}
+        # Before the search, not after it: a directory the result cannot be
+        # written to must cost the caller nothing, not minutes of every core.
+        self.check_writable()
         started = time.monotonic()
         found = _work.solve_parallel(bytes.fromhex(root), threshold,
                                      budget_seconds=budget_seconds, workers=workers)
@@ -284,6 +339,17 @@ class WorkCache(object):
         entry["precomputed"] = root
         return entry
 
+    def check_writable(self) -> None:
+        """Raise CacheUnwritable unless a file can be created in the cache."""
+        try:
+            os.makedirs(self.directory, exist_ok=True)
+            handle, temporary = tempfile.mkstemp(prefix=".probe-", dir=self.directory)
+            os.close(handle)
+            os.unlink(temporary)
+        except OSError as exc:
+            raise CacheUnwritable("cannot write to the work cache at %s: %s"
+                                  % (self.directory, exc)) from None
+
     # ------------------------------------------------------------ internals
 
     def _write_json(self, path: str, payload: dict) -> None:
@@ -292,16 +358,24 @@ class WorkCache(object):
         try:
             os.makedirs(directory, exist_ok=True)
         except OSError as exc:
-            raise CacheError("cannot create the work cache at %s: %s" % (directory, exc))
-        handle, temporary = tempfile.mkstemp(prefix=".work-", dir=directory)
+            raise CacheUnwritable("cannot create the work cache at %s: %s"
+                                  % (directory, exc)) from None
+        temporary = None
         try:
+            handle, temporary = tempfile.mkstemp(prefix=".work-", dir=directory)
             with os.fdopen(handle, "w", encoding="utf-8") as stream:
                 json.dump(payload, stream, indent=2, sort_keys=True)
                 stream.write("\n")
             os.replace(temporary, path)
+        except OSError as exc:
+            raise CacheUnwritable("cannot write to the work cache at %s: %s"
+                                  % (directory, exc)) from None
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            if temporary is not None and os.path.exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     def _evict(self) -> None:
         for root in self.roots()[MAX_ENTRIES:]:
