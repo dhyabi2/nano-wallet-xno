@@ -232,18 +232,15 @@ class HttpNanoNode(NanoNode):
         # has already confirmed. `confirmed` now says whether the tip itself is
         # confirmed, which is the question a caller was asking all along - it
         # used to be `confirmed_height is not None`, true for every opened
-        # account, including this one.
+        # account, including this one - and it fails closed: see
+        # `_tip_is_confirmed`.
         frontier = answer["frontier"]
-        confirmed_frontier = answer.get("confirmed_frontier") or \
-            answer.get("confirmation_height_frontier")
         return {
             "frontier": frontier,
             "balance_raw": int(answer["balance"]),
             "representative": answer.get("representative"),
             "block_count": int(answer.get("block_count", 0)),
-            # A node that reports no confirmed frontier cannot tell us; that is
-            # the answer this returned before, kept rather than guessed at.
-            "confirmed": confirmed_frontier == frontier if confirmed_frontier else True,
+            "confirmed": _tip_is_confirmed(answer, frontier),
             # #10 added this flag and a `send` refusal for the state this pull
             # request removes: the frontier and the balance used to come from two
             # different moments, so `send` refused while they disagreed rather
@@ -348,6 +345,36 @@ class HttpNanoNode(NanoNode):
         if _is_hash(successor) and successor.strip("0"):
             found["successor"] = successor.upper()
         return found
+
+
+def _tip_is_confirmed(answer: dict, frontier: str) -> bool:
+    """Whether the network has confirmed the account's latest block.
+
+    Fails closed: True only when the node's answer shows it. The confirmed
+    frontier is compared first (`confirmed_frontier`, then the older
+    `confirmation_height_frontier`), case-insensitively, since hex from a node
+    is not promised to be upper case. Without either, the heights: Nano numbers
+    an account's blocks from 1 (the open block), so the tip's height IS
+    `block_count`, and the tip is confirmed exactly when the confirmation height
+    has reached it. `confirmed_height` comes with include_confirmed and
+    `confirmation_height` without it; they are the same number. A node that
+    says neither has not told us the tip is confirmed, so it is not reported as
+    though it were.
+    """
+    confirmed_frontier = answer.get("confirmed_frontier") or \
+        answer.get("confirmation_height_frontier")
+    if confirmed_frontier:
+        return str(confirmed_frontier).upper() == str(frontier).upper()
+    height = answer.get("confirmed_height")
+    if height is None:
+        height = answer.get("confirmation_height")
+    count = answer.get("block_count")
+    if height is None or count is None:
+        return False
+    try:
+        return int(count) > 0 and int(height) == int(count)
+    except (TypeError, ValueError):
+        return False
 
 
 def _is_hash(value) -> bool:

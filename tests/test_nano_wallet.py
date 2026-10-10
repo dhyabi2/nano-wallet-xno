@@ -538,7 +538,8 @@ class TestAccountInfoReadsOnePointInTime(unittest.TestCase):
 
     def test_a_node_that_reports_no_confirmed_frontier_still_works(self):
         """Not every node answers include_confirmed. It must still be usable,
-        and its balance must still be the balance at its frontier."""
+        its balance must still be the balance at its frontier, and its silence
+        about confirmation must not be read as a confirmation."""
         answer = self.answer()
         for key in ("confirmed_frontier", "confirmation_height_frontier",
                     "confirmed_balance", "confirmed_representative", "confirmed_height"):
@@ -546,6 +547,23 @@ class TestAccountInfoReadsOnePointInTime(unittest.TestCase):
         info = self.node(answer).account_info(GENESIS)
         self.assertEqual(info["frontier"], self.TIP)
         self.assertEqual(info["balance_raw"], 6 * self.XNO)
+        # confirmation_height 51 of block_count 52: the tip is not confirmed.
+        self.assertFalse(info["confirmed"])
+        # And with no confirmation data at all, it fails closed too.
+        answer.pop("confirmation_height")
+        self.assertFalse(self.node(answer).account_info(GENESIS)["confirmed"])
+
+    def test_confirmation_is_read_from_the_heights_when_no_frontier_is_given(self):
+        answer = self.answer()
+        for key in ("confirmed_frontier", "confirmation_height_frontier"):
+            answer.pop(key)
+        answer.update(confirmation_height="52", confirmed_height="52")
+        self.assertTrue(self.node(answer).account_info(GENESIS)["confirmed"])
+
+    def test_the_confirmed_frontier_is_compared_whatever_its_case(self):
+        info = self.node(self.answer(
+            frontier=self.CONFIRMED, balance=str(5 * self.XNO),
+            confirmed_frontier=self.CONFIRMED.lower())).account_info(GENESIS)
         self.assertTrue(info["confirmed"])
 
     def test_an_account_that_was_never_opened_is_empty(self):

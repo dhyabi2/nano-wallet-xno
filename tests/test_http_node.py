@@ -502,18 +502,17 @@ class ASendIsNeverBuiltOnAMixedAccountState(unittest.TestCase):
         # #10 had to fail closed here, because it could not prove the confirmed
         # balance it was returning belonged to the frontier. Nothing is read
         # from the confirmed side any more, so there is nothing to prove: the
-        # balance is the tip's whatever the node says about confirmation. The
-        # node's silence does move `confirmed`, which this branch reads as True
-        # when there is no confirmed frontier to compare - the answer the method
-        # gave before, kept rather than guessed at - and that is asserted here
-        # too, so the choice is written down rather than implied.
+        # balance is the tip's whatever the node says about confirmation.
+        # `confirmed` fails closed: with no confirmed frontier to compare it is
+        # read from the heights, and a confirmation height of 6 against a block
+        # count of 7 means the tip (height 7) is not confirmed yet.
         answer = self._info()
         del answer["confirmed_frontier"]
         node = self._answers(answer)
         info = node.account_info("nano_x")
         self.assertEqual(info["balance_raw"], 6 * self.ONE)
         self.assertTrue(info["balance_is_frontier_balance"])
-        self.assertTrue(info["confirmed"])
+        self.assertFalse(info["confirmed"])
 
     # --------------------------------------------------------------- the money
 
