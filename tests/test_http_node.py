@@ -418,9 +418,17 @@ class ASendIsNeverBuiltOnAMixedAccountState(unittest.TestCase):
     the account on top of the payment: measured below, a 1 XNO send out of a
     tip holding 6 XNO against a confirmed 5 moved 2 XNO.
 
-    Which of the two a send should be built on is a judgement about a chain the
-    wallet is extending and is open in #4. These tests pin the narrower claim:
-    while the two disagree, nothing is signed.
+    #10 pinned the narrower claim - while the two disagree, nothing is signed -
+    and left which of the two a send should be built on open in #4. THIS branch
+    is #4, and it answers it: `account_info` reads the tip's frontier beside the
+    tip's own balance, so the two can no longer disagree. #10's flag is therefore
+    always true and its `send` refusal never fires. The refusal is kept (a later
+    change that reintroduces a mixed pair meets it again rather than silently
+    overpaying), and the four tests that asserted a mixed state is REFUSED now
+    assert the stronger thing: off the same node answer that moved 2 XNO for an
+    asked 1 XNO, exactly 1 XNO moves. The defect is still held in one place, as
+    a mutation - pair the tip's frontier with the confirmed balance again, the
+    way `main` did, and 2 XNO moves.
     """
 
     ONE = 10 ** 30
@@ -467,9 +475,14 @@ class ASendIsNeverBuiltOnAMixedAccountState(unittest.TestCase):
 
     # ---------------------------------------------------- what the node is asked
 
-    def test_a_balance_from_another_block_is_reported_as_such(self):
+    def test_the_balance_reported_is_the_frontiers_own(self):
+        # The node answers a tip of 6 XNO against a confirmed 5. Both come back
+        # from the tip, so the pair agrees and the flag says so.
         node = self._answers(self._info())
-        self.assertFalse(node.account_info("nano_x")["balance_is_frontier_balance"])
+        info = node.account_info("nano_x")
+        self.assertEqual(info["frontier"], self.TIP)
+        self.assertEqual(info["balance_raw"], 6 * self.ONE)
+        self.assertTrue(info["balance_is_frontier_balance"])
 
     def test_a_settled_account_is_reported_as_settled(self):
         node = self._answers(self._info(confirmed_frontier=self.TIP))
@@ -485,37 +498,54 @@ class ASendIsNeverBuiltOnAMixedAccountState(unittest.TestCase):
         self.assertTrue(info["balance_is_frontier_balance"])
         self.assertEqual(info["balance_raw"], 6 * self.ONE)
 
-    def test_a_confirmed_balance_with_no_confirmed_frontier_is_not_proven(self):
-        # The node has not said the two match, so it fails closed rather than
-        # being given the benefit of the doubt on the send path.
+    def test_a_confirmed_balance_with_no_confirmed_frontier_is_still_the_tips(self):
+        # #10 had to fail closed here, because it could not prove the confirmed
+        # balance it was returning belonged to the frontier. Nothing is read
+        # from the confirmed side any more, so there is nothing to prove: the
+        # balance is the tip's whatever the node says about confirmation. The
+        # node's silence does move `confirmed`, which this branch reads as True
+        # when there is no confirmed frontier to compare - the answer the method
+        # gave before, kept rather than guessed at - and that is asserted here
+        # too, so the choice is written down rather than implied.
         answer = self._info()
         del answer["confirmed_frontier"]
         node = self._answers(answer)
-        self.assertFalse(node.account_info("nano_x")["balance_is_frontier_balance"])
+        info = node.account_info("nano_x")
+        self.assertEqual(info["balance_raw"], 6 * self.ONE)
+        self.assertTrue(info["balance_is_frontier_balance"])
+        self.assertTrue(info["confirmed"])
 
     # --------------------------------------------------------------- the money
 
-    def test_a_send_on_a_mixed_state_is_refused_and_nothing_is_signed(self):
+    def test_a_send_on_the_very_answer_that_overpaid_moves_what_was_asked(self):
+        # The same node answer #10 measured 2 XNO leaving on. #10 refused it;
+        # this sends it, because there is no longer anything mixed about it.
         node = self._answers(self._info())
-        with self.assertRaises(payments.ToolError) as caught:
-            self._send(node)
-        self.assertEqual(caught.exception.reason, "account_state_unsettled")
-        self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(self.published, [], "nothing may be published")
+        self._send(node)
+        self.assertEqual(len(self.published), 1)
+        block = self.published[0]
+        self.assertEqual(block["previous"], self.TIP, "previous must be the tip")
+        moved = 6 * self.ONE - int(block["balance"])
+        self.assertEqual(
+            moved, self.ONE,
+            "a send of 1 XNO off this answer moves %d raw" % moved)
 
-    def test_without_the_refusal_that_send_moves_twice_what_was_asked(self):
-        # The defect itself, held in one place: build the same block from the
-        # same answer with the guard's input flipped, and read the amount the
-        # way Nano reads it.
+    def test_pairing_the_tip_with_the_confirmed_balance_again_moves_twice(self):
+        # The defect itself, still held in one place, now as a mutation of the
+        # production change rather than of #10's guard: put the confirmed
+        # balance back beside the tip's frontier, the way `main` reads it, and
+        # read the amount the way Nano reads it. #10's refusal is deliberately
+        # not reached - the flag is left true - so what this measures is the
+        # pairing alone.
         node = self._answers(self._info())
         real = node.account_info
 
-        def mixed_but_unflagged(address):
+        def tip_frontier_confirmed_balance(address):
             info = real(address)
-            info["balance_is_frontier_balance"] = True
+            info["balance_raw"] = 5 * self.ONE   # `main`'s pairing
             return info
 
-        node.account_info = mixed_but_unflagged
+        node.account_info = tip_frontier_confirmed_balance
         self._send(node)
         self.assertEqual(len(self.published), 1)
         block = self.published[0]
@@ -523,7 +553,27 @@ class ASendIsNeverBuiltOnAMixedAccountState(unittest.TestCase):
         moved = 6 * self.ONE - int(block["balance"])
         self.assertEqual(
             moved, 2 * self.ONE,
-            "a send of 1 XNO off this answer moves %d raw" % moved)
+            "the old pairing moves %d raw for an asked 1 XNO" % moved)
+
+    def test_the_refusal_is_kept_so_a_future_mixed_pair_still_cannot_send(self):
+        # #10's guard is unreachable from `account_info` now, and stays in
+        # `payments.send` on purpose: it is the thing that catches a later change
+        # which starts mixing the two again.
+        node = self._answers(self._info())
+        real = node.account_info
+
+        def flagged_mixed(address):
+            info = real(address)
+            info["balance_raw"] = 5 * self.ONE
+            info["balance_is_frontier_balance"] = False
+            return info
+
+        node.account_info = flagged_mixed
+        with self.assertRaises(payments.ToolError) as caught:
+            self._send(node)
+        self.assertEqual(caught.exception.reason, "account_state_unsettled")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.published, [], "nothing may be published")
 
     def test_a_settled_account_still_sends_exactly_what_was_asked(self):
         node = self._answers(self._info(confirmed_frontier=self.TIP,

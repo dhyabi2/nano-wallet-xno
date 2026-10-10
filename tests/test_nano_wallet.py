@@ -20,10 +20,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import blocks
 import cli
 import ed25519_blake2b as ed
 import mcp_server
 import nanoaddr
+import nanonode
 import wallet
 
 BURN = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
@@ -455,6 +457,100 @@ class TestHelpNamesSomethingThatExists(unittest.TestCase):
         for name in mine:
             with self.subTest(script=name):
                 self.assertIn(name, first_line)
+
+class TestAccountInfoReadsOnePointInTime(unittest.TestCase):
+    """`frontier`/`balance` and `confirmed_frontier`/`confirmed_balance` are two
+    different points on the account's chain, and they must be read as a pair.
+
+    No socket is opened here: `_rpc` is replaced with a recorded answer, which
+    is the only part of `HttpNanoNode` that talks to the network. Nothing in
+    this repository exercised that mapping before - `fakenode.py` implements
+    the `NanoNode` interface directly and so never goes through it.
+    """
+
+    XNO = 10 ** 30
+    TIP = "B" * 64          # an unconfirmed receive of 1 XNO; the account holds 6
+    CONFIRMED = "A" * 64    # the confirmation height, two seconds behind; it held 5
+
+    def node(self, answer):
+        node = nanonode.HttpNanoNode("http://node.invalid")
+        node._rpc = lambda payload: dict(answer)
+        return node
+
+    def answer(self, **over):
+        base = {
+            "frontier": self.TIP,
+            "open_block": self.CONFIRMED, "representative_block": self.CONFIRMED,
+            "balance": str(6 * self.XNO),
+            "confirmed_balance": str(5 * self.XNO),
+            "block_count": "52",
+            "confirmation_height": "51", "confirmed_height": "51",
+            "confirmation_height_frontier": self.CONFIRMED,
+            "confirmed_frontier": self.CONFIRMED,
+            "representative": BURN, "confirmed_representative": BURN,
+        }
+        base.update(over)
+        return base
+
+    def test_the_balance_belongs_to_the_frontier_it_is_returned_with(self):
+        info = self.node(self.answer()).account_info(GENESIS)
+        self.assertEqual(info["frontier"], self.TIP)
+        self.assertEqual(
+            info["balance_raw"], 6 * self.XNO,
+            "the balance returned is not the balance AT the frontier returned; a send "
+            "built on that frontier will move the difference as well")
+
+    def test_a_send_moves_exactly_what_was_asked_for(self):
+        """The consequence, in Nano's own arithmetic.
+
+        A send's amount is `previous.balance - block.balance`. With the tip's
+        frontier and the confirmed balance this was 6 - (5 - 1) = 2 XNO for a
+        1 XNO payment: the agent paid out everything it had just been paid, on
+        top of what it meant to send.
+        """
+        info = self.node(self.answer()).account_info(GENESIS)
+        amount_raw = 1 * self.XNO
+        balance_at_previous = 6 * self.XNO          # what the ledger holds at info["frontier"]
+        new_balance = int(info["balance_raw"]) - amount_raw
+        self.assertEqual(
+            balance_at_previous - new_balance, amount_raw,
+            "a send of %d raw would actually move %d raw"
+            % (amount_raw, balance_at_previous - new_balance))
+        # And it is a real block: nothing above depends on the arithmetic alone.
+        signed = blocks.build_signed(
+            bytes.fromhex(ZERO_SEED_PRIV), bytes.fromhex(ZERO_SEED_PUB),
+            bytes.fromhex(info["frontier"]), bytes(32), new_balance,
+            bytes.fromhex(GENESIS_PK), "send")
+        self.assertEqual(int(signed["balance"]), balance_at_previous - amount_raw)
+
+    def test_an_unconfirmed_tip_is_not_reported_as_confirmed(self):
+        info = self.node(self.answer()).account_info(GENESIS)
+        self.assertFalse(
+            info["confirmed"],
+            "the tip is not the confirmed frontier, so this account's latest block "
+            "is not confirmed and must not be reported as though it were")
+
+    def test_a_tip_that_is_confirmed_is_reported_as_confirmed(self):
+        info = self.node(self.answer(
+            frontier=self.CONFIRMED, balance=str(5 * self.XNO))).account_info(GENESIS)
+        self.assertTrue(info["confirmed"])
+        self.assertEqual(info["balance_raw"], 5 * self.XNO)
+
+    def test_a_node_that_reports_no_confirmed_frontier_still_works(self):
+        """Not every node answers include_confirmed. It must still be usable,
+        and its balance must still be the balance at its frontier."""
+        answer = self.answer()
+        for key in ("confirmed_frontier", "confirmation_height_frontier",
+                    "confirmed_balance", "confirmed_representative", "confirmed_height"):
+            answer.pop(key)
+        info = self.node(answer).account_info(GENESIS)
+        self.assertEqual(info["frontier"], self.TIP)
+        self.assertEqual(info["balance_raw"], 6 * self.XNO)
+        self.assertTrue(info["confirmed"])
+
+    def test_an_account_that_was_never_opened_is_empty(self):
+        self.assertEqual(self.node({"error": "Account not found"}).account_info(GENESIS), {})
+
 
 if __name__ == "__main__":
     unittest.main()
