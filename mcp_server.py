@@ -30,6 +30,7 @@ import traceback
 import keystore as _keystore
 import nanonode
 import payments
+import prework
 import profiles
 import wallet
 
@@ -189,7 +190,12 @@ class Server:
 
     def node(self) -> nanonode.NanoNode:
         if self._node is None:
-            self._node = nanonode.HttpNanoNode(self.env.get("NANO_NODE_URL", ""))
+            # The work cache comes from the SAME environment as the node URL:
+            # a Server given env= must not pick up a cache directory from the
+            # process-wide os.environ that its caller never configured.
+            self._node = nanonode.HttpNanoNode(
+                self.env.get("NANO_NODE_URL", ""),
+                prework=prework.WorkCache.from_env(self.env))
         return self._node
 
     # -- dispatch --------------------------------------------------------
