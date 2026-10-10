@@ -40,8 +40,41 @@ class NodeError(Exception):
         self.message = message
 
 
+# Answers to `process` that say the block itself is invalid - fixed by its own
+# bytes and the block it names as `previous` - so it can never land, here or on
+# any other node. Matched case-insensitively as substrings of the node's error.
+# Deliberately NOT here, because each leaves the block able to land: "Old block"
+# (it is already on the ledger), "Fork" (it is in an election it may still win),
+# "Gap ..." (the node may apply it once the block before it arrives), and the
+# RPC's subtype checks ("Invalid block balance for given subtype", ...), which
+# compare against the account's CURRENT balance, so a block that landed earlier
+# fails them once the account has moved on. Anything unrecognised is not a
+# verdict either.
+# `process` raises these as NodeError("block_rejected"), the one NodeError that is
+# a verdict on the block rather than on the connection.
+_REJECTIONS = (
+    "bad signature",
+    "work is less than threshold",
+    "insufficient work",
+    "negative spend",
+    "balance and amount delta do not match",
+    "balance mismatch",
+    "cannot follow the previous block",
+    "block is invalid",
+)
+_NOT_REJECTIONS = ("old block", "fork", "gap", "subtype")
+
+
+def is_rejection(error) -> bool:
+    """True when a node's `process` error says the block can never be valid."""
+    text = str(error or "").lower()
+    if any(marker in text for marker in _NOT_REJECTIONS):
+        return False
+    return any(marker in text for marker in _REJECTIONS)
+
+
 class NanoNode:
-    """The RPC surface this wallet needs. Five calls, no more."""
+    """The RPC surface this wallet needs. Six calls, no more."""
 
     def account_info(self, address: str) -> dict:
         """`{"frontier","balance_raw","representative","block_count","confirmed"}`,
@@ -65,6 +98,19 @@ class NanoNode:
 
     def process(self, block: dict) -> str:
         """Publish a signed block; return its hash."""
+        raise NotImplementedError
+
+    def block_info(self, block_hash: str) -> dict:
+        """`{"account","confirmed"}` for a block on the ledger, or `{}` when this
+        node does not have it, plus `previous` (the block it builds on) and
+        `successor` (the block built on it) when the node reports them. Used
+        only to settle a send whose reply was lost.
+
+        `confirmed` must be a bool: the wallet reads only `True` as confirmed,
+        so pass the RPC's "true"/"false" strings through as bools, not as text.
+        A subclass that does not implement this keeps working; a send whose
+        reply was lost and whose account has since moved on then stays
+        `send_outcome_unknown` instead of being settled."""
         raise NotImplementedError
 
 
@@ -144,6 +190,17 @@ class HttpNanoNode(NanoNode):
             # that one call - anywhere else it is still a node error.
             if payload.get("action") == "account_info" and answer["error"] == "Account not found":
                 return {}
+            # Likewise `block_info` for a block the node does not have: an
+            # answer ("not here"), not a failure to reach the node.
+            if payload.get("action") == "block_info" and answer["error"] == "Block not found":
+                return {}
+            # Only for a send: that is the one block whose record a rejection
+            # frees. A receive or an open the node refuses stays a node_error,
+            # as it always was.
+            if (payload.get("action") == "process" and payload.get("subtype") == "send"
+                    and is_rejection(answer["error"])):
+                raise NodeError("block_rejected", "the Nano node at %s rejected the block: %s"
+                                % (host_of(self.url), answer["error"]))
             raise NodeError("node_error", "the Nano node at %s returned: %s"
                             % (host_of(self.url), answer["error"]))
         return answer
@@ -256,3 +313,29 @@ class HttpNanoNode(NanoNode):
             raise NodeError("publish_failed",
                             "the node at %s accepted no block" % host_of(self.url))
         return block_hash
+
+    def block_info(self, block_hash: str) -> dict:
+        answer = self._rpc({"action": "block_info", "json_block": "true", "hash": block_hash})
+        if not answer.get("block_account"):
+            return {}
+        found = {"account": answer["block_account"],
+                 "confirmed": str(answer.get("confirmed", "false")) == "true"}
+        contents = answer.get("contents")
+        if isinstance(contents, dict) and _is_hash(contents.get("previous")):
+            found["previous"] = contents["previous"].upper()
+        # "0" * 64 is the node's way of saying nothing is built on this block
+        # yet; it is not a block, so it is left out rather than passed on.
+        successor = answer.get("successor")
+        if _is_hash(successor) and successor.strip("0"):
+            found["successor"] = successor.upper()
+        return found
+
+
+def _is_hash(value) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True

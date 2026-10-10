@@ -68,6 +68,35 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         with self.assertRaises(nanonode.NodeError):
             node.process({"type": "state", "_subtype": "send"})
 
+    def test_a_block_the_node_does_not_have_is_empty_not_an_error(self):
+        node, _ = self._node({"error": "Block not found"})
+        self.assertEqual(node.block_info("A" * 64), {})
+
+    def test_block_not_found_is_only_forgiven_for_block_info(self):
+        node, _ = self._node({"error": "Block not found"})
+        with self.assertRaises(nanonode.NodeError):
+            node.account_info(NEW)
+
+    def test_a_block_on_the_ledger_names_its_account_and_confirmation(self):
+        node, seen = self._node({"block_account": NEW, "confirmed": "true",
+                                 "contents": {"type": "state"}})
+        self.assertEqual(node.block_info("A" * 64), {"account": NEW, "confirmed": True})
+        self.assertEqual(json.loads(seen[-1].data)["action"], "block_info")
+
+    def test_a_block_on_the_ledger_names_the_blocks_either_side_of_it(self):
+        node, _ = self._node({"block_account": NEW, "confirmed": "false",
+                              "successor": "b" * 64,
+                              "contents": {"type": "state", "previous": "a" * 64}})
+        self.assertEqual(node.block_info("C" * 64),
+                         {"account": NEW, "confirmed": False,
+                          "previous": "A" * 64, "successor": "B" * 64})
+
+    def test_a_zero_successor_is_no_successor(self):
+        node, _ = self._node({"block_account": NEW, "confirmed": "true",
+                              "successor": "0" * 64,
+                              "contents": {"type": "state", "previous": "not a hash"}})
+        self.assertEqual(node.block_info("C" * 64), {"account": NEW, "confirmed": True})
+
     def test_process_tells_the_node_the_block_subtype(self):
         # A receive built on a stale balance is rejected by the node rather than
         # published, but only because the node is told which direction the block
@@ -79,6 +108,41 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         body = json.loads(seen[-1].data.decode("utf-8"))
         self.assertEqual(body["subtype"], "receive")
         self.assertNotIn("_subtype", body["block"])
+
+    def test_a_block_the_node_rejects_as_invalid_is_a_rejection(self):
+        # The node read the block and said it can never be valid: not a lost
+        # reply, so the wallet may build a new one instead of holding this one.
+        for error in ("Block work is less than threshold", "Bad signature",
+                      "Balance and amount delta do not match", "Negative spend",
+                      "Block is invalid"):
+            node, _ = self._node({"error": error})
+            with self.assertRaises(nanonode.NodeError) as caught:
+                node.process({"type": "state", "_subtype": "send"})
+            self.assertEqual(caught.exception.reason, "block_rejected", error)
+            self.assertIn(error, caught.exception.message)
+
+    def test_a_rejected_receive_or_open_is_still_a_node_error(self):
+        # Only a send's record is freed by a rejection; a receive or an open
+        # the node refuses answers as it did before: node_error.
+        for subtype in ("receive", "open"):
+            node, _ = self._node({"error": "Bad signature"})
+            with self.assertRaises(nanonode.NodeError) as caught:
+                node.process({"type": "state", "_subtype": subtype})
+            self.assertEqual(caught.exception.reason, "node_error", subtype)
+            self.assertIn("Bad signature", caught.exception.message)
+
+    def test_an_answer_that_says_nothing_about_the_block_itself_is_not_a_rejection(self):
+        # "Old block" means it IS on the ledger; "Fork" means it is in an
+        # election it may still win; a gap means the node may apply it once the
+        # block before it arrives; the RPC's subtype checks read the account's
+        # CURRENT balance, so a block that landed earlier fails them once the
+        # account has moved on; anything unrecognised is not a verdict.
+        for error in ("Old block", "Fork", "Gap previous block", "Gap source block",
+                      "Invalid block balance for given subtype", "Something new"):
+            node, _ = self._node({"error": error})
+            with self.assertRaises(nanonode.NodeError) as caught:
+                node.process({"type": "state", "_subtype": "send"})
+            self.assertEqual(caught.exception.reason, "node_error", error)
 
     def test_every_call_names_itself(self):
         # Cloudflare-fronted public nodes answer urllib's default

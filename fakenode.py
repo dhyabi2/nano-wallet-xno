@@ -92,6 +92,19 @@ class FakeNode(nanonode.NanoNode):
         self.published.append(dict(block))
         return block_hash
 
+    def block_info(self, block_hash: str) -> dict:
+        self._guard("block_info")
+        for block in self.published:
+            if _hash_of(block) == block_hash:
+                found = {"account": block["account"], "confirmed": True,
+                         "previous": block["previous"].upper()}
+                for later in self.published:
+                    if (later["account"] == block["account"]
+                            and later["previous"].upper() == block_hash.upper()):
+                        found["successor"] = _hash_of(later)
+                return found
+        return {}
+
 
 def _hash_of(block: dict) -> str:
     """Recompute the block hash from the block, the way a node would."""
