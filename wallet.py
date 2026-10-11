@@ -93,7 +93,17 @@ def xno_to_raw(amount: str) -> int:
         raise ValueError("amount is not a decimal number: %r" % amount)
     whole, _, frac = text.partition(".")
     whole = whole or "0"
-    if not whole.isdigit() or (frac and not frac.isdigit()):
+    # `isascii()` as well as `isdigit()`, because `str.isdigit()` is true for
+    # every Unicode digit. Without it "1\u0662 3" without the space - an ASCII
+    # 1, an Arabic-Indic 2 and an ASCII 3 - passed this check and `int()` read
+    # it as 123, so a string no peer would call a number was silently given an
+    # amount and sent. A JavaScript `/^\d+$/` counterparty refuses exactly
+    # these, and this package's own `mandate.py` already refuses them
+    # (`parse_raw`, `xno_to_raw`), so without this check the two halves of one
+    # install disagreed about what an amount is. On a feeless, irreversible
+    # rail there is nothing to undo a send of the wrong amount with.
+    if not (whole.isdigit() and whole.isascii()) \
+            or (frac and not (frac.isdigit() and frac.isascii())):
         raise ValueError("amount is not a decimal number: %r" % amount)
     if len(frac) > 30:
         raise ValueError("Nano has 30 decimal places; %d were given" % len(frac))

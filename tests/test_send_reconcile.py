@@ -107,6 +107,25 @@ class AnUnknownSendIsSettledFromTheLedger(unittest.TestCase):
     def balance(self):
         return self.node.accounts[self.agent]["balance_raw"]
 
+    def test_an_amount_that_is_not_ascii_digits_sends_nothing(self):
+        # The money-level half of the wallet.xno_to_raw refusal. "0." followed
+        # by an Arabic-Indic five is not a decimal number any peer would
+        # accept, but `str.isdigit()` is true for it and `int()` reads it, so
+        # this moved a real 0.5 XNO out of the account on a feeless,
+        # irreversible rail. Nothing is signed and nothing is published now.
+        with self.assertRaises(payments.ToolError) as caught:
+            self.send(amount="0.\u0665")
+        self.assertEqual(caught.exception.reason, "invalid_amount")
+        self.assertEqual(self.sends_applied(), [], "a block was signed and published")
+        self.assertEqual(self.balance(), 10 * RAW, "XNO left the account")
+        self.assertEqual(self.sent, {}, "the key was consumed by a send that must not happen")
+
+    def test_an_ascii_amount_in_the_same_shape_still_sends(self):
+        # The control: the refusal above must not narrow a real amount.
+        out = self.send(amount="0.5")
+        self.assertEqual(out["amount_xno"], "0.500000")
+        self.assertEqual(self.balance(), 10 * RAW - 5 * 10 ** 29)
+
     def test_a_block_that_landed_is_returned_as_the_payment(self):
         self.first_attempt_fails("lose_reply")
         landed = fakenode._hash_of(self.sends_applied()[0])

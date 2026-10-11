@@ -273,6 +273,29 @@ class TestAmounts(unittest.TestCase):
         for bad in ("", "-1", "abc", "1.2.3", "0." + "1" * 31):
             with self.assertRaises(ValueError):
                 wallet.xno_to_raw(bad)
+
+    def test_rejects_non_ascii_digits(self):
+        # `str.isdigit()` is true for every Unicode digit, and `int()` reads
+        # most of them, so without an `isascii()` check these were given an
+        # amount and sent. "1\u0662" + "3" came back as 123 XNO - a string no
+        # JavaScript `/^\d+$/` peer would accept as a number at all. The
+        # package's own mandate.py already refuses them, so the two halves of
+        # one install disagreed about what an amount is.
+        for bad in ("\u0661",            # Arabic-Indic one
+                    "\uff11",            # fullwidth one
+                    "1\u06623",          # ASCII 1, Arabic-Indic 2, ASCII 3
+                    "0.\u0665",          # non-ASCII in the fraction
+                    "\u0660.5"):         # non-ASCII in the whole part
+            with self.assertRaises(ValueError):
+                wallet.xno_to_raw(bad)
+
+    def test_still_accepts_every_ascii_spelling_it_did_before(self):
+        # The control: the refusal above must not narrow anything real.
+        for text, expected in (("1", 10 ** 30), ("0", 0), ("0.5", 5 * 10 ** 29),
+                               (".5", 5 * 10 ** 29), ("1.", 10 ** 30),
+                               ("0.000000000000000000000000000001", 1),
+                               ("  7.25  ", 725 * 10 ** 28)):
+            self.assertEqual(wallet.xno_to_raw(text), expected, text)
         with self.assertRaises(ValueError):
             wallet.raw_to_xno(-1)
         with self.assertRaises(ValueError):
