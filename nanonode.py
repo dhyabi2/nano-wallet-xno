@@ -115,6 +115,38 @@ class NanoNode:
         raise NotImplementedError
 
 
+def raw_from_node(value, field: str, host: str) -> int:
+    """A raw amount as a Nano node sends it: a string of ASCII digits.
+
+    `int()` reads more than that. It reads a JSON number, and raw carries 31
+    digits where a float64 holds about 16: a balance of 6900000000000000000000
+    000000000 raw arriving as the number 6.9e30 becomes
+    6899999999999999883876432347136, 116123567652864 raw low. It also reads
+    `true` as 1. `send` computes the block's new balance as `balance_raw -
+    amount_raw`, while Nano reads the amount a send moved as the LEDGER's
+    `previous.balance - block.balance` - so the error is not cancelled out: for
+    the balance above, an asked 1 XNO moves 1.000000000000000116123567652864
+    XNO, and a value that rounds the other way pays the seller short. On a
+    feeless, irreversible rail there is nothing to undo either with.
+
+    `isascii()` as well as `isdigit()`: `str.isdigit()` is true for non-ASCII
+    digits ("\u0663"), which `int()` also reads, and those are not what a node
+    sends either.
+
+    A reply that does not carry raw this way is not a usable answer about this
+    account, so it is a `node_error` - the caller holds and retries, and
+    nothing is signed.
+    """
+    if isinstance(value, str) and value.isdigit() and value.isascii():
+        return int(value)
+    raise NodeError(
+        "node_error",
+        "the Nano node at %s answered %s as %s (%.80s), not a whole number of raw in "
+        "ASCII digits; nothing was signed"
+        % (host, field, type(value).__name__, repr(value)),
+    )
+
+
 def host_of(url: str) -> str:
     """The host of a node URL, with any credentials stripped.
 
@@ -249,7 +281,7 @@ class HttpNanoNode(NanoNode):
         frontier = answer["frontier"]
         return {
             "frontier": frontier,
-            "balance_raw": int(answer["balance"]),
+            "balance_raw": raw_from_node(answer["balance"], "balance", host_of(self.url)),
             "representative": answer.get("representative"),
             "block_count": int(answer.get("block_count", 0)),
             "confirmed": _tip_is_confirmed(answer, frontier),
@@ -276,12 +308,16 @@ class HttpNanoNode(NanoNode):
             return []
         out = []
         for block_hash, info in blocks.items():
+            host = host_of(self.url)
             if isinstance(info, dict):
                 out.append({"hash": block_hash,
-                            "amount_raw": int(info["amount"]),
+                            "amount_raw": raw_from_node(info["amount"], "a receivable amount",
+                                                        host),
                             "source": info.get("source")})
             else:
-                out.append({"hash": block_hash, "amount_raw": int(info), "source": None})
+                out.append({"hash": block_hash,
+                            "amount_raw": raw_from_node(info, "a receivable amount", host),
+                            "source": None})
         return out[:count]
 
     def work_generate(self, root_hex: str, subtype: str = None) -> str:
