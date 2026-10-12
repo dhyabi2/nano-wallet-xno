@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import unittest
+from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -273,6 +274,19 @@ class TestAmounts(unittest.TestCase):
         for bad in ("", "-1", "abc", "1.2.3", "0." + "1" * 31):
             with self.assertRaises(ValueError):
                 wallet.xno_to_raw(bad)
+        with self.assertRaises(ValueError):
+            wallet.raw_to_xno(-1)
+        with self.assertRaises(ValueError):
+            wallet.raw_to_xno("1")
+
+    def test_rejects_an_amount_that_is_not_a_string(self):
+        # str() used to turn a float into its repr, so 0.30000000000000004
+        # became 300000000000000040000000000000 raw. Only a str is an amount.
+        for bad in (0.30000000000000004, 0.1, 1.0, 1, 0, Decimal("0.1"),
+                    True, False, None, b"1"):
+            with self.subTest(amount=bad):
+                with self.assertRaises(ValueError):
+                    wallet.xno_to_raw(bad)
 
     def test_rejects_non_ascii_digits(self):
         # `str.isdigit()` is true for every Unicode digit, and `int()` reads
@@ -296,10 +310,6 @@ class TestAmounts(unittest.TestCase):
                                ("0.000000000000000000000000000001", 1),
                                ("  7.25  ", 725 * 10 ** 28)):
             self.assertEqual(wallet.xno_to_raw(text), expected, text)
-        with self.assertRaises(ValueError):
-            wallet.raw_to_xno(-1)
-        with self.assertRaises(ValueError):
-            wallet.raw_to_xno("1")
 
 
 class TestMcpServer(unittest.TestCase):

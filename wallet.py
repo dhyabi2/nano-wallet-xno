@@ -83,7 +83,17 @@ def sign_message(message: bytes, private_key_hex: str) -> dict:
 
 def xno_to_raw(amount: str) -> int:
     """Exact decimal XNO -> integer raw. No float is used anywhere."""
-    text = str(amount).strip()
+    # Only a `str`. This used to read `str(amount)`, so a JSON number reached
+    # here as a float and was stringified: `"amount_xno": 0.30000000000000004`
+    # over MCP sent 300000000000000040000000000000 raw, and 0.1 and 1 were sent
+    # too, although the tool schema says "decimal string, never a float" and
+    # mandate.xno_to_raw already refuses anything that is not a str. int,
+    # Decimal and bool are refused with it: an amount is text an agent wrote,
+    # never a number some JSON parser chose for it.
+    if not isinstance(amount, str):
+        raise ValueError("amount must be a decimal string, got %s %r"
+                         % (type(amount).__name__, amount))
+    text = amount.strip()
     if not text:
         raise ValueError("amount is empty")
     negative = text.startswith("-")

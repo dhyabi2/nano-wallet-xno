@@ -17,6 +17,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -516,6 +517,63 @@ class SendIsGated(unittest.TestCase):
         server.call_tool("send", {"from": address, "to": BURN,
                                   "amount_xno": "0.000001", "idempotency_key": "k4"})
         self.assertEqual(node.accounts[address]["balance_raw"], RAW - RAW // 10 ** 6)
+
+    # An amount that is not a str. wallet.xno_to_raw used to call str() on it,
+    # so a JSON number sent its float repr: 0.30000000000000004 XNO went out as
+    # 300000000000000040000000000000 raw. The schema says "decimal string,
+    # never a float", and the mandate parser already refuses non-str.
+    NOT_STRINGS = (0.30000000000000004, 0.1, 1.0, 1, Decimal("0.1"), True, False)
+
+    def funded_server(self):
+        env = {"NANO_WALLET_ALLOW_SEND": "1"}
+        keys, node = keystore.KeyStore(), fakenode.FakeNode()
+        server = mcp_server.Server(profiles.FULL, env=env, node=node, keys=keys)
+        address = a_new_address(keys)
+        node.fund(address, 10 * RAW)
+        server.call_tool("receive", {"address": address})
+        return env, keys, node, server, address
+
+    def test_payments_send_refuses_an_amount_that_is_not_a_string(self):
+        env, keys, node, _, address = self.funded_server()
+        for i, amount in enumerate(self.NOT_STRINGS):
+            published = len(node.published)
+            with self.subTest(amount=amount):
+                with self.assertRaises(payments.ToolError) as caught:
+                    payments.send(address, BURN, amount, "ns-%d" % i, node, keys, {}, env)
+                self.assertEqual(caught.exception.reason, "invalid_amount")
+                self.assertEqual(len(node.published), published)   # nothing sent
+        self.assertEqual(node.accounts[address]["balance_raw"], 10 * RAW)
+
+    def test_a_json_number_amount_over_mcp_is_refused(self):
+        _, _, node, server, address = self.funded_server()
+        for i, wire in enumerate(("0.30000000000000004", "0.1", "1", "1.0", "true", "false")):
+            line = json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                               "params": {"name": "send", "arguments": {
+                                   "from": address, "to": BURN, "amount_xno": "@",
+                                   "idempotency_key": "wire-%d" % i}}})
+            line = line.replace('"@"', wire)                  # a JSON number on the wire
+            stdout = io.StringIO()
+            published = len(node.published)
+            server.serve(io.StringIO(line + "\n"), stdout)
+            result = json.loads(stdout.getvalue())["result"]
+            with self.subTest(amount_xno=wire):
+                self.assertTrue(result["isError"], result)
+                self.assertEqual(result["structuredContent"]["error"], "invalid_amount")
+                self.assertEqual(len(node.published), published)   # nothing sent
+        self.assertEqual(node.accounts[address]["balance_raw"], 10 * RAW)
+
+    def test_a_decimal_string_amount_over_mcp_is_still_sent(self):
+        # The control: the same wire path with the amount as a string still sends.
+        _, _, node, server, address = self.funded_server()
+        line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "send", "arguments": {
+                               "from": address, "to": BURN, "amount_xno": "0.1",
+                               "idempotency_key": "wire-ok"}}})
+        stdout = io.StringIO()
+        server.serve(io.StringIO(line + "\n"), stdout)
+        result = json.loads(stdout.getvalue())["result"]
+        self.assertFalse(result["isError"], result)
+        self.assertEqual(node.accounts[address]["balance_raw"], 10 * RAW - RAW // 10)
 
 
 class CliSurface(unittest.TestCase):
