@@ -93,7 +93,9 @@ def xno_to_raw(amount: str) -> int:
     if not isinstance(amount, str):
         raise ValueError("amount must be a decimal string, got %s %r"
                          % (type(amount).__name__, amount))
-    text = amount.strip()
+    # `str.strip`, not `amount.strip()`: a str subclass could override
+    # strip() and hand back a different amount than the text it holds.
+    text = str.strip(amount)
     if not text:
         raise ValueError("amount is empty")
     negative = text.startswith("-")

@@ -288,6 +288,13 @@ class TestAmounts(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     wallet.xno_to_raw(bad)
 
+    def test_a_str_subclass_is_read_as_the_text_it_holds(self):
+        # A subclass's own strip() must not decide the amount.
+        class Odd(str):
+            def strip(self, *args):
+                return "5"
+        self.assertEqual(wallet.xno_to_raw(Odd("0.1")), 10 ** 29)
+
     def test_rejects_non_ascii_digits(self):
         # `str.isdigit()` is true for every Unicode digit, and `int()` reads
         # most of them, so without an `isascii()` check these were given an
