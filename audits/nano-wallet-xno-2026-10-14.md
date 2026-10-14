@@ -46,7 +46,7 @@ ok    nanonode.py is the ONLY module in the wallet that touches the network
   well as `isdigit()` — without which `"1٢3"` read as 123. A zero amount is refused
   downstream by `payments.send`'s `amount_raw <= 0`, which is the guard that catches
   `xno_to_raw(".") == 0`.
-- **`mandate.py`'s cap enforcement**, the part earlier audits named but had not read through:
+- **`mandate.py`'s cap enforcement**, re-read end to end (as the 10-01 and 10-09 audits also did) to confirm it still holds at 6420e93:
   `validate_fields` → `verify_signed` → `MandateGuard._read` → `_check` → `spend`. The order
   is correct and the reservation is right: `spend` verifies the signed mandate
   (`verify_signed`, `mandate.py:623`), then takes an exclusive `flock` (`mandate.py:624`),
