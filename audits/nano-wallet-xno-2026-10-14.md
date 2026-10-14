@@ -3,14 +3,15 @@
 Lens: can an agent hold XNO and pay — or get paid — with this wallet today without being
 hurt?
 
-Starting point: `main` at `HEAD`. **Nothing changed this run.** No defect I could prove, and
-no open pull request on this repository. This note records what was checked so the next run
-does not re-tread it.
+Starting point: `main` at `6420e93`. **Nothing changed in the code this run.** No defect I
+could prove, and no other open pull request on this repository besides this one. This note
+records what was checked so the next run does not re-tread it.
 
 ## The repository's own three claims, all verified first-hand
 
-`README.md:330-338` tells a reader to run three commands before trusting the wallet. All
-three were run, and all three print exactly what the README says they print:
+`README.md:331-340` tells a reader to run three commands before trusting the wallet. All
+three were run, and all three print exactly what the README says they print (the claimed
+outputs are at `README.md:333`, `:336` and `:339`):
 
 | command | README claims | measured |
 | --- | --- | --- |
@@ -18,8 +19,10 @@ three were run, and all three print exactly what the README says they print:
 | `python3 e2e_check.py` | `20/20 checks passed` | **20/20 checks passed** |
 | `python3 e2e_receive_only.py` | `16/16 receive-only end-to-end checks passed` | **16/16 passed** |
 
-The 10-12 audit recorded 297 tests against a README that then said 297; tests have been added
-since and the README was kept in step. The count is right today.
+The 10-12 audit is where the count last moved: it added the 10 tests in
+`tests/test_node_raw_must_be_digits.py` (#19) and itself updated `README.md:333` from 297 to
+307 (`audits/nano-wallet-xno-2026-10-12.md:75-76`). No tests have been added since, and the
+count is right today.
 
 Two of the `e2e_check` assertions are worth naming because they are the custody claim stated
 as something checkable rather than asserted, and they pass:
@@ -45,13 +48,16 @@ ok    nanonode.py is the ONLY module in the wallet that touches the network
   `xno_to_raw(".") == 0`.
 - **`mandate.py`'s cap enforcement**, the part earlier audits named but had not read through:
   `validate_fields` → `verify_signed` → `MandateGuard._read` → `_check` → `spend`. The order
-  is correct and the reservation is right: `spend` takes an exclusive `flock`, re-verifies the
-  signed mandate, re-reads the ledger, checks per-payment max / payee allow-list / remaining
-  cap, **writes the reservation, and only then calls `send()`** — and on any exception marks
-  the entry `unknown` rather than removing it, because a cap that forgets an unknown payment
-  can be overrun. `per > total` is refused at validation, the operator and agent must differ,
-  and the mandate's hash is checked against its content before the signature is checked
-  against the operator's key.
+  is correct and the reservation is right: `spend` verifies the signed mandate
+  (`verify_signed`, `mandate.py:623`), then takes an exclusive `flock` (`mandate.py:624`),
+  re-reads the ledger under it, checks per-payment max / payee allow-list / remaining cap,
+  **writes the reservation, and only then calls `send()`** — and on any exception marks the
+  entry `unknown` rather than removing it, because a cap that forgets an unknown payment can
+  be overrun. Verifying before the lock is not a race: the mandate is the in-memory
+  `self.signed`, which nothing else can change between the check and the lock; the state
+  other processes share — the ledger — is read only once the lock is held. `per > total` is
+  refused at validation, the operator and agent must differ, and the mandate's hash is
+  checked against its content before the signature is checked against the operator's key.
 - `_representative_pk` carries the account's existing representative into both the send and
   the receive block, and `nanonode.account_info` asks for it (`"representative": "true"`).
   This is the defect the twin repositories had; re-confirmed today that `nano-mcp-public` has
@@ -61,7 +67,7 @@ ok    nanonode.py is the ONLY module in the wallet that touches the network
 ## Two observations, neither worth a change
 
 - **The ledger's integrity check uses `str(...).isdigit()`**
-  (`mandate.py:567`): `spent = int(data["spent_raw"]) if str(data["spent_raw"]).isdigit() else None`.
+  (`mandate.py:568`): `spent = int(data["spent_raw"]) if str(data["spent_raw"]).isdigit() else None`.
   `str.isdigit()` is true for every Unicode digit, which is the exact hazard this codebase
   fixes deliberately in `wallet.xno_to_raw` (`isascii()`), in `mandate.parse_raw`, and in the
   sibling repositories' amount patterns. It is **not** a defect here: the ledger is a local
