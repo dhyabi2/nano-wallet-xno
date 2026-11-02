@@ -11,6 +11,7 @@ command used below on your PATH, one line installs it (no dependencies):
 
 ```
 pip install git+https://github.com/dhyabi2/nano-wallet-xno
+# or pinned to the tagged release: pip install "nano-wallet-xno @ git+https://github.com/dhyabi2/nano-wallet-xno@v1.2.0"
 ```
 
 Every `nano-wallet <command>` in this README is the same as
