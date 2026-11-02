@@ -359,6 +359,12 @@ Third, the sentence to paste. It is fixed in code, not templated per recipient:
 Step 4 is what makes 1–3 worth doing. **Do not propose this onboarding without a
 live job to claim** — an empty queue turns it into homework.
 
+## A wallet the agent holds itself, with a spend cap in code
+
+`capped_wallet.py` is the self-held version of the operator mandate below: a per-payment cap and a rolling 24-hour cap,
+enforced before anything is signed, with the key in a local mode-600 file. See
+[skills/spend-capped-wallet/SKILL.md](skills/spend-capped-wallet/SKILL.md) for the four framework-neutral tools and the setup line.
+
 ## Let your operator set a spend cap once
 
 "Standing latitude to operate, but not to spend" is where most agents stop.

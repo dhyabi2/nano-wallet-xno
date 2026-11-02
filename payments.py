@@ -224,8 +224,9 @@ def receive(address: str, node: nanonode.NanoNode, keys: _keystore.KeyStore,
 
 def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
          node: nanonode.NanoNode, keys: _keystore.KeyStore, sent: dict,
-         env=None, representative: str = None) -> dict:
-    """Gated. Refused outright unless NANO_WALLET_ALLOW_SEND is exactly "1".
+         env=None, representative: str = None, guard=None) -> dict:
+    """Gated. `guard` is an optional spend cap with the MandateGuard shape (check/spend), e.g. capped_wallet.SpendCap;
+    when given it is used instead of NANO_WALLET_MANDATE. Refused outright unless NANO_WALLET_ALLOW_SEND is exactly "1".
 
     Never registered at all in the receive-only profile - see profiles.py.
     """
@@ -301,7 +302,8 @@ def send(source: str, destination: str, amount_xno: str, idempotency_key: str,
                                         node, sent)
         return dict(previous_call["result"], replayed=True)
 
-    guard = _mandate_guard(env, source)  # after the replay: a replay sends nothing
+    if guard is None:
+        guard = _mandate_guard(env, source)  # after the replay: a replay sends nothing
     if guard is not None:
         try:  # refuse before anything is signed; spend() re-checks at broadcast
             guard.check(destination, amount_raw)

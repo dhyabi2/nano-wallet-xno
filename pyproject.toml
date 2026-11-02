@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-wallet-xno"
-version = "1.2.0"
+version = "1.3.0"
 description = "Nano (XNO) wallet as one install, with a receive-only profile an operator can verify: create, validate, balance, receive. No dependencies, no custody, send not registered."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -16,9 +16,10 @@ nano-wallet = "cli:main"
 mandate = "mandate:main"
 nano-keygen = "nano_keygen:main"
 nano-pay402 = "pay402:main"
+nano-capped-wallet = "capped_wallet:main"
 
 [tool.setuptools]
 py-modules = ["nanoaddr", "ed25519_blake2b", "wallet", "cli", "mcp_server",
               "profiles", "capabilities", "selfcheck", "payments", "blocks",
               "keystore", "nanonode", "fakenode", "wellknown",
-              "mandate", "work", "prework", "nano_keygen", "pay402"]
+              "mandate", "work", "prework", "nano_keygen", "pay402", "capped_wallet"]
