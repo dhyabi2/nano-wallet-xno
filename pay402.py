@@ -30,9 +30,6 @@ import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
 import ed25519_blake2b as _ed
 import keystore as _keystore
@@ -57,24 +54,17 @@ class Refused(Exception):
 
 # ------------------------------------------------------------------ fetch
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
 def fetch(url, method="GET", data=None, headers=None, timeout=20):
-    """(status, headers dict lower-cased, body bytes). Never follows a redirect."""
-    request = urllib.request.Request(url, data=data, method=method,
-                                     headers=dict({"User-Agent": USER_AGENT}, **(headers or {})))
-    opener = urllib.request.build_opener(_NoRedirect)
+    """(status, headers dict lower-cased, body bytes). Never follows a redirect.
+
+    The HTTP call itself lives in nanonode.http_fetch: nanonode.py is the one module
+    in this wallet that touches the network (e2e_check.py proves it)."""
     try:
-        with opener.open(request, timeout=timeout) as response:
-            return response.status, {k.lower(): v for k, v in response.headers.items()}, \
-                response.read(MAX_BODY)
-    except urllib.error.HTTPError as exc:
-        return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read(MAX_BODY)
-    except (urllib.error.URLError, OSError) as exc:
-        raise Refused("unreachable", "could not reach %s: %s" % (url, getattr(exc, "reason", exc))) from None
+        return nanonode.http_fetch(url, method=method, data=data,
+                                   headers=dict({"User-Agent": USER_AGENT}, **(headers or {})),
+                                   timeout=timeout, max_body=MAX_BODY)
+    except nanonode.Unreachable as exc:
+        raise Refused("unreachable", "could not reach %s: %s" % (url, exc)) from None
 
 
 # --------------------------------------------------------------- the entry
@@ -146,7 +136,7 @@ def plan(url, accepts, max_xno=None):
             raise Refused("binding_scheme_unsupported",
                           "the seller requires a payment binding this tool cannot make (%r): not paying"
                           % (binding.get("scheme") if isinstance(binding, dict) else binding))
-        wanted = resource_key(urllib.parse.unquote(urllib.parse.urlsplit(url).path))
+        wanted = resource_key(nanonode.url_path(url))
         if binding.get("resource") != wanted:
             raise Refused("binding_resource_mismatch",
                           "the seller's binding is for resource %r but you asked for %r: not paying"
@@ -289,7 +279,7 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
         if len(args) != 1 or args[0].startswith("--"):
             raise Refused("usage", "expected exactly one URL, got %r" % args)
         url = args[0]
-        if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        if nanonode.url_scheme(url) not in ("http", "https"):
             raise Refused("usage", "URL must be http or https")
         body = data.encode("utf-8") if data is not None else None
         status, headers, response = fetcher(url, method=method, data=body,

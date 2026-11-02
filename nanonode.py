@@ -14,6 +14,7 @@ opens a socket.
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import prework as _prework
@@ -145,6 +146,40 @@ def raw_from_node(value, field: str, host: str) -> int:
         "ASCII digits; nothing was signed"
         % (host, field, type(value).__name__, repr(value)),
     )
+
+
+class Unreachable(OSError):
+    """An HTTP peer could not be reached at all (DNS, refused, timeout)."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def http_fetch(url, method="GET", data=None, headers=None, timeout=20, max_body=1 << 20):
+    """(status, headers dict lower-cased, body bytes) for a plain HTTP call that never
+    follows a redirect. Used by pay402.py to read a seller's 402 and fetch the paid
+    resource; it lives here so that this file stays the wallet's only network module."""
+    request = urllib.request.Request(url, data=data, method=method, headers=dict(headers or {}))
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, \
+                response.read(max_body)
+    except urllib.error.HTTPError as exc:
+        return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read(max_body)
+    except (urllib.error.URLError, OSError) as exc:
+        raise Unreachable(str(getattr(exc, "reason", exc))) from None
+
+
+def url_path(url: str) -> str:
+    """The unquoted path of a URL (pay402's binding resource key)."""
+    return urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+
+
+def url_scheme(url: str) -> str:
+    return urllib.parse.urlsplit(url).scheme
 
 
 def host_of(url: str) -> str:
