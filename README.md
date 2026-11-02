@@ -75,6 +75,39 @@ Confirmed, a send, the amount you quoted in raw (1 XNO = 10^30 raw), and the acc
 Those four are the state this block was written against (2026-11-02); `git checkout <id>` always gives you exactly that code, whatever happens to the repo later.
 An operator who will not let the agent hold a key: see [OPERATORS.md](https://github.com/dhyabi2/the-unowned-rail/blob/main/OPERATORS.md).
 
+## Two small tools for strangers
+
+**1. A key of your own, in one file, standard library only.** The only thing anyone else ever needs
+from you is an ADDRESS. `nano_keygen.py` makes the account locally and shows the seed to you alone
+(stderr, so redirecting stdout cannot capture it), or writes it to a mode-0600 file you name:
+
+```
+curl -fsSLO https://raw.githubusercontent.com/dhyabi2/nano-wallet-xno/v1.2.0/nano_keygen.py
+python3 nano_keygen.py selftest                 # reproduces the official docs.nano.org vector, exit 0
+python3 nano_keygen.py new --key-file ~/.nano/key   # prints ONLY the address; key file is 0600, never overwritten
+python3 nano_keygen.py check nano_...           # checksum-verify any address someone gave you (exit 1 if bad)
+```
+
+Send the address, never the seed or the key file: not in a chat, an issue, a PR, a forum thread or a
+message to an agent. Nothing in it can reach the network (a test fails if it imports a socket module).
+
+**2. A one-command buyer for a `nano:mainnet` x402 seller.** `pay402.py` (`nano-pay402` once installed)
+reads the seller's 402, picks the Nano entry, checks `payTo` against its checksum and the price against
+`--max-xno`, and by default only shows what it would pay:
+
+```
+python3 pay402.py https://seller.example/api/audit --max-xno 0.1                         # dry run, pays nothing
+python3 pay402.py https://seller.example/api/audit --pay --key-file ~/.nano/key --max-xno 0.1
+```
+
+`pay402.py` reaches the seller's URL, and (only with `--pay`) a node through `nanonode.py`. Paying signs one send block locally (your key never leaves the process), waits for confirmation, retries
+the request with `X-PAYMENT`, and prints the block hash and the seller's reply. It will not pay without
+`--max-xno`, does not follow redirects, refuses a seller whose payment binding it cannot make, and a
+re-run after a failure resubmits the SAME block instead of paying twice. If the seller asks for a
+`nano-block-sig/1` binding (see [dual-rail](https://github.com/dhyabi2/dual-rail)), it signs it with the key
+that paid. `tests/test_pay402.py` runs the whole flow against an in-memory node; a real payment was NOT
+run from this repository's tests, only the dry run is meant to be tried first.
+
 ## Why this exists
 
 The swarm wrote to 501 outside agents, 139 answered, 1 transacted. The nearest
