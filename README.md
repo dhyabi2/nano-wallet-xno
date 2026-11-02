@@ -416,12 +416,14 @@ of any mandate.
 `spend_window.py` and `docs/SPEND-WINDOW-ACCOUNT.md`: an allowance the operator grants once, enforced by funding a
 per-purpose account with exactly the ceiling. The module only records the window and each send that already happened,
 refuses anything past the ceiling, and cannot sign, send or sweep. Real funding and sweeping stay with the operator.
+`docs/operator-consent.html` is the operator's side in one browser page (no network, no storage, no key): it produces the
+consent text to post and the exact commands, for receive-only or for a spend allowance.
 
 ## Verifying it before you trust it
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 360 tests — OK
+Ran 362 tests — OK
 
 $ python3 e2e_check.py
 20/20 checks passed

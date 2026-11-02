@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Operator consent for an agent that handles XNO</title>
+<style>
+ body{font:16px/1.5 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem;color:#111;background:#fff}
+ @media (prefers-color-scheme:dark){body{color:#eee;background:#161616}input,select,textarea{background:#222;color:#eee;border:1px solid #555}}
+ label{display:block;margin:.8rem 0 .2rem;font-weight:600} input,select{width:100%;padding:.5rem;box-sizing:border-box}
+ button{margin-top:1rem;padding:.7rem 1.2rem;font-size:1rem} pre{white-space:pre-wrap;border:1px solid #888;padding:.8rem;overflow-x:auto}
+ .err{color:#b00020} small{color:#666}
+</style></head><body>
+<h1>Your agent said "that is my operator's call"</h1>
+<p>This page is that call, in one form. It runs in your browser only: nothing is sent anywhere, nothing is stored, no key is
+asked for. It produces (1) a short consent text you post where anyone can read it, and (2) the exact commands to check the address and,
+if you want the agent to spend, to record a spend allowance. Receiving needs no spending approval; choose that first.</p>
+<form id="f">
+ <label for="mode">What are you approving?</label>
+ <select id="mode"><option value="receive-only">Receive only: the agent publishes an address, holds no key, cannot spend</option>
+ <option value="spend-window">A spend allowance: a separate account funded once, the balance is the cap</option></select>
+ <label for="purpose">What is it for?</label><input id="purpose" placeholder="e.g. get paid for the weekly report endpoint">
+ <label for="address">Account address (you made it; the key stays with you)</label><input id="address" placeholder="nano_...">
+ <div id="spend" hidden>
+  <label for="ceiling">Ceiling in XNO (fund the account with exactly this)</label><input id="ceiling" inputmode="decimal" placeholder="0.05">
+  <label for="expires">Ends (UTC)</label><input id="expires" placeholder="2026-12-01T00:00:00Z">
+  <label for="url">Where you will post the consent text (optional now)</label><input id="url" placeholder="https://...">
+ </div>
+ <label for="approver">Who is approving (name or handle)</label><input id="approver">
+ <button type="submit">Make my consent text</button>
+</form>
+<p id="errors" class="err" role="alert"></p>
+<div id="result" hidden>
+ <h2>1. Post this</h2><pre id="text"></pre>
+ <h2>2. Run these on a machine you trust</h2><pre id="cmds"></pre>
+ <small>Commands are from <a href="https://github.com/dhyabi2/nano-wallet-xno">nano-wallet-xno</a>. Clone it and read it before running anything.</small>
+</div>
+<script src="consent.js"></script>
+<script>
+ var $=function(i){return document.getElementById(i)};
+ $('mode').addEventListener('change',function(){$('spend').hidden=$('mode').value!=='spend-window'});
+ $('f').addEventListener('submit',function(e){e.preventDefault();
+  var r=OperatorConsent.buildConsent({mode:$('mode').value,purpose:$('purpose').value,address:$('address').value,ceilingXno:$('ceiling').value,
+   expires:$('expires').value,approver:$('approver').value,approvalUrl:$('url').value,now:new Date()});
+  $('errors').textContent=r.ok?'':r.errors.join('; ');$('result').hidden=!r.ok;
+  if(r.ok){$('text').textContent=r.consentText;$('cmds').textContent=r.commands.join('\n');}});
+</script></body></html>
