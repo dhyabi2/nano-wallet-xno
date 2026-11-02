@@ -411,11 +411,17 @@ in code as documented. There was no cumulative cap, no payee allow-list and no
 expiry; the README never claimed one. The per-call limit still applies on top
 of any mandate.
 
+## Spend-window account (design, record only)
+
+`spend_window.py` and `docs/SPEND-WINDOW-ACCOUNT.md`: an allowance the operator grants once, enforced by funding a
+per-purpose account with exactly the ceiling. The module only records the window and each send that already happened,
+refuses anything past the ceiling, and cannot sign, send or sweep. Real funding and sweeping stay with the operator.
+
 ## Verifying it before you trust it
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 307 tests — OK
+Ran 360 tests — OK
 
 $ python3 e2e_check.py
 20/20 checks passed
