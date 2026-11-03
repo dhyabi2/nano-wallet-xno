@@ -254,7 +254,8 @@ def _():
 #: selfcheck.py imports socket only in order to BLOCK it - `no_sockets()` replaces
 #: socket.socket with something that raises, which is how check 5 proves that
 #: address creation made no network call rather than asserting it did not.
-EXEMPT = {"nanonode.py", "wellknown.py", "selfcheck.py",
+#: tomb_check.py is a standalone read-only address check (no key, sends nothing).
+EXEMPT = {"nanonode.py", "wellknown.py", "selfcheck.py", "tomb_check.py",
           "e2e_check.py", "e2e_receive_only.py", "fakenode.py"}
 
 
