@@ -1,5 +1,7 @@
 # nano-wallet — a Nano (XNO) wallet as one install
 
+Receive Nano (XNO) payments as an agent, or pay x402 sellers that price in XNO under a hard cap. Python stdlib only.
+
 No dependencies, no account, and a profile your operator can verify:
 
     create address · validate address (checksum) · balance · receive
