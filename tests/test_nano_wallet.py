@@ -252,10 +252,11 @@ class TestWallet(unittest.TestCase):
             and imports_of(name[:-3]) & forbidden
         )
         self.assertEqual(
-            network_capable, ["nanonode", "selfcheck", "wellknown"],
+            network_capable, ["nanonode", "selfcheck", "tomb_check", "wellknown"],
             "the set of network-touching modules changed: %s. nanonode speaks to the "
             "node and carries pay402's seller fetch (nanonode.http_fetch), wellknown serves "
-            "one read-only document, and selfcheck imports socket only to BLOCK it. "
+            "one read-only document, selfcheck imports socket only to BLOCK it, and "
+            "tomb_check is a standalone read-only address check (no key, sends nothing). "
             "e2e_check.py holds the same line." % network_capable,
         )
 
