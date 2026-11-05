@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -332,14 +333,14 @@ class PinPayTo(Funded):
         content = json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER}})
         with open(self.pins, "w") as handle:
             handle.write(content)
-        real_open = open
+        real_open = os.open
 
         def denying_open(path, *a, **kw):
             if path == self.pins:
                 raise PermissionError(13, "Permission denied", path)
             return real_open(path, *a, **kw)
 
-        with mock.patch("builtins.open", denying_open):
+        with mock.patch.object(pay402.os, "open", denying_open):
             code, out = self.read(SELLER)
         self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
         with open(self.pins) as handle:
@@ -455,6 +456,40 @@ class PinPayTo(Funded):
         with open(target) as handle:
             self.assertEqual(handle.read(), "keep")
 
+    def _pay_refused(self, reason):
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--pin-file", self.pins], Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, reason), out)
+        self.assertEqual(len(self.node.published), before, "nothing is paid")
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
+    def test_symlink_swapped_in_after_the_islink_check_is_refused(self):
+        real = os.path.join(self.tmp.name, "real.json")
+        content = json.dumps({"https://seller.example:443": {"pay_to": SELLER, "first_seen": "x"}})
+        with open(real, "w") as handle:
+            handle.write(content)
+        os.symlink(real, self.pins)
+        # islink() said "plain file", then the path became a link: the open must not follow it.
+        with mock.patch.object(pay402.os.path, "islink", return_value=False):
+            self._pay_refused("pin-file-unreadable")
+        self.assertTrue(os.path.islink(self.pins))
+        with open(real) as handle:
+            self.assertEqual(handle.read(), content)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW") and pay402.fcntl is not None, "needs O_NOFOLLOW and fcntl")
+    def test_symlink_at_lock_path_is_refused(self):
+        target = os.path.join(self.tmp.name, "victim")
+        os.symlink(target, self.pins + ".lock")
+        self._pay_refused("pin-file-unwritable")
+        self.assertFalse(os.path.lexists(target), "the lock open does not follow the link")
+        self.assertFalse(os.path.lexists(self.pins))
+
+    def test_deeply_nested_pin_file_is_refused(self):
+        self._refused_untouched("[" * 100000, "pin-file-malformed")
+        self._pay_refused("pin-file-malformed")
+
+
 
 class SentLedgerFailsClosed(Funded):
     def test_corrupt_sent_ledger_is_refused_before_signing(self):
@@ -479,6 +514,19 @@ class SentLedgerFailsClosed(Funded):
                         Seller(challenge(entry())), self.node)
         self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), out)
         self.assertEqual(len(self.node.published), before)
+
+    def test_deeply_nested_sent_ledger_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        content = "[" * 100000
+        with open(ledger, "w") as handle:
+            handle.write(content)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), out)
+        self.assertEqual(len(self.node.published), before)
+        with open(ledger) as handle:
+            self.assertEqual(handle.read(), content)
 
 
 def _hash(block):

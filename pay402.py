@@ -189,7 +189,7 @@ def check_pin(pin_path, url, pay_to, now=time.time):
             # save would replace a live link with a plain file: refuse any link outright.
             raise Refused("pin-file-unreadable", "pin file %s is a symlink; point --pin-file at "
                           "the real file: not paying" % pin_path)
-        pins = _strict_load(pin_path, "pin-file")
+        pins = _strict_load(pin_path, "pin-file", nofollow=True)
         for key, value in pins.items():
             if not (isinstance(value, dict)
                     and isinstance(value.get("pay_to"), str) and value["pay_to"]
@@ -253,12 +253,16 @@ def _no_duplicate_keys(pairs):
     return out
 
 
-def _strict_load(path, what):
+def _strict_load(path, what, nofollow=False):
     """The JSON object at path; {} ONLY when the file does not exist. Anything else that is
-    wrong (unreadable, a directory, not JSON, a repeated key, not an object) raises Refused('<what>-unreadable'
-    or '<what>-malformed'): an empty reading of a damaged file would forget what it held."""
+    wrong (unreadable, a directory, not JSON, a repeated key, too deeply nested, not an object)
+    raises Refused('<what>-unreadable' or '<what>-malformed'): an empty reading of a damaged file
+    would forget what it held. With nofollow the open uses O_NOFOLLOW (where the OS has it), so
+    a symlink swapped in after an islink() check is refused (ELOOP) rather than followed."""
+    flags = os.O_RDONLY | (getattr(os, "O_NOFOLLOW", 0) if nofollow else 0)
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
             text = handle.read()
     except FileNotFoundError:
         return {}
@@ -266,7 +270,7 @@ def _strict_load(path, what):
         raise Refused(what + "-unreadable", "cannot read %s: %s: not paying" % (path, exc)) from None
     try:
         data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise Refused(what + "-malformed", "%s is not valid JSON (%s): fix or remove it by hand: "
                       "not paying" % (path, exc)) from None
     if not isinstance(data, dict):
@@ -288,7 +292,7 @@ def _file_lock(path):
         yield
         return
     try:
-        fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as exc:
         raise Refused("pin-file-unwritable", "cannot open lock file %s.lock: %s" % (path, exc)) from None
     try:
