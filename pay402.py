@@ -174,8 +174,8 @@ def check_pin(pin_path, url, pay_to, now=time.time):
     Returns the pin record. The file is only written on first sight of an origin.
 
     Fails closed: a missing pin file is the only "no pins yet". A pin file that cannot be read,
-    is not JSON, is not a JSON object, or holds an entry that is not {"pay_to": "<non-empty>", ...}
-    is refused (pin-file-unreadable / pin-file-malformed / pin-entry-malformed) and is NOT
+    is a symlink, is not JSON, repeats a key, is not a JSON object, or holds an entry that is not
+    {"pay_to": "<non-empty>", "first_seen": "<non-empty>", ...} is refused (pin-file-unreadable / pin-file-malformed / pin-entry-malformed) and is NOT
     rewritten, so a damaged file never silently loses the other sellers' pins. The
     read-check-write runs under an exclusive flock on `pin_path + ".lock"` (POSIX; where fcntl
     does not exist the lock is skipped and concurrent writers can still race)."""
@@ -184,20 +184,27 @@ def check_pin(pin_path, url, pay_to, now=time.time):
     except ValueError as exc:
         raise Refused("usage", "cannot take the origin of %r: %s" % (url, exc)) from None
     with _file_lock(pin_path):
+        if os.path.islink(pin_path):
+            # A dangling link would read as "no pins yet" (every seller trusted fresh) and the
+            # save would replace a live link with a plain file: refuse any link outright.
+            raise Refused("pin-file-unreadable", "pin file %s is a symlink; point --pin-file at "
+                          "the real file: not paying" % pin_path)
         pins = _strict_load(pin_path, "pin-file")
         for key, value in pins.items():
-            if not (isinstance(value, dict) and isinstance(value.get("pay_to"), str)
-                    and value["pay_to"]):
+            if not (isinstance(value, dict)
+                    and isinstance(value.get("pay_to"), str) and value["pay_to"]
+                    and isinstance(value.get("first_seen"), str) and value["first_seen"]):
                 raise Refused("pin-entry-malformed",
-                              "pin file %s: the entry for %r is not {\"pay_to\": ...}; fix or "
-                              "remove it by hand: not paying" % (pin_path, key))
+                              "pin file %s: the entry for %r is not {\"pay_to\": ..., "
+                              "\"first_seen\": ...}; fix or remove it by hand: not paying"
+                              % (pin_path, key))
         pinned = pins.get(origin)
         if pinned is not None:
             if pinned["pay_to"] != pay_to:
                 raise Refused("payto-changed",
                               "%s named payTo %s when first read (%s), now %s: not paying. If the "
                               "seller really moved, remove its entry from %s"
-                              % (origin, pinned["pay_to"], pinned.get("first_seen"), pay_to, pin_path))
+                              % (origin, pinned["pay_to"], pinned["first_seen"], pay_to, pin_path))
             return dict(pinned, origin=origin, pinned_now=False)
         record = {"pay_to": pay_to,
                   "first_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))}
@@ -236,9 +243,19 @@ def payment_header(block_hash, entry, private_key=None):
 
 # ------------------------------------------------------------------- pay
 
+def _no_duplicate_keys(pairs):
+    """object_pairs_hook: a repeated key would let the last value silently win."""
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key %r" % key)
+        out[key] = value
+    return out
+
+
 def _strict_load(path, what):
     """The JSON object at path; {} ONLY when the file does not exist. Anything else that is
-    wrong (unreadable, a directory, not JSON, not an object) raises Refused('<what>-unreadable'
+    wrong (unreadable, a directory, not JSON, a repeated key, not an object) raises Refused('<what>-unreadable'
     or '<what>-malformed'): an empty reading of a damaged file would forget what it held."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -248,7 +265,7 @@ def _strict_load(path, what):
     except (OSError, UnicodeDecodeError) as exc:
         raise Refused(what + "-unreadable", "cannot read %s: %s: not paying" % (path, exc)) from None
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except ValueError as exc:
         raise Refused(what + "-malformed", "%s is not valid JSON (%s): fix or remove it by hand: "
                       "not paying" % (path, exc)) from None
@@ -376,6 +393,9 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
         data = _opt(args, "--data")
         ledger = _opt(args, "--ledger")
         pin_file = _opt(args, "--pin-file")
+        if pin_file is not None and not pin_file.strip():
+            raise Refused("usage", "--pin-file needs a file path, got %r: an empty path would "
+                          "silently turn pinning off" % pin_file)
         if len(args) != 1 or args[0].startswith("--"):
             raise Refused("usage", "expected exactly one URL, got %r" % args)
         url = args[0]
@@ -386,7 +406,7 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
                                             headers={"Content-Type": "application/json"} if body else {})
         accepts = read_accepts(status, headers, response)
         summary, entry = plan(url, accepts, max_xno)
-        if pin_file:
+        if pin_file is not None:
             pin = check_pin(os.path.expanduser(pin_file), url, summary["pay_to"])
             summary["pin"] = {"origin": pin["origin"], "pay_to": pin["pay_to"],
                               "first_seen": pin["first_seen"], "pinned_now": pin["pinned_now"]}

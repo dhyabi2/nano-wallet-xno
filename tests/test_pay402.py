@@ -384,6 +384,67 @@ class PinPayTo(Funded):
         leftovers = [n for n in os.listdir(self.tmp.name) if n.endswith(".tmp")]
         self.assertEqual(leftovers, [])
 
+    def test_empty_pin_file_value_is_a_usage_error(self):
+        for value in ("", "   "):
+            seller = Seller(challenge(entry()))
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                             "--pin-file", value], seller, self.node)
+            self.assertEqual((code, out.get("refused")), (2, "usage"), (value, out))
+            self.assertIn("--pin-file", out["message"])
+            self.assertEqual(seller.requests, [], "refused before the seller is even read")
+        self.assertEqual(self.sends(), [])
+
+    def test_entry_without_first_seen_is_refused(self):
+        self._refused_untouched(json.dumps({"https://seller.example:443": {"pay_to": SELLER}}),
+                                "pin-entry-malformed")
+
+    def test_entry_of_another_origin_without_first_seen_is_refused(self):
+        self._refused_untouched(json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER}}),
+                                "pin-entry-malformed")
+
+    def test_files_this_code_writes_still_load(self):
+        self.read(SELLER)
+        self.read(SELLER, url="https://other.example/x")
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["pin"]["pinned_now"])
+
+    def test_duplicate_origin_key_is_refused(self):
+        content = ('{"https://seller.example:443": {"pay_to": "%s", "first_seen": "a"}, '
+                   '"https://seller.example:443": {"pay_to": "%s", "first_seen": "b"}}'
+                   % (OTHER_SELLER, SELLER))
+        self._refused_untouched(content, "pin-file-malformed")
+
+    def test_duplicate_inner_key_is_refused(self):
+        content = ('{"https://seller.example:443": {"pay_to": "%s", "pay_to": "%s", '
+                   '"first_seen": "a"}}' % (OTHER_SELLER, SELLER))
+        self._refused_untouched(content, "pin-file-malformed")
+
+    def test_dangling_symlink_at_pin_path_is_refused(self):
+        os.symlink(os.path.join(self.tmp.name, "missing.json"), self.pins)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        self.assertTrue(os.path.islink(self.pins))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "missing.json")))
+
+    def test_live_symlink_at_pin_path_is_refused_and_kept(self):
+        real = os.path.join(self.tmp.name, "real.json")
+        content = json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER, "first_seen": "x"}})
+        with open(real, "w") as handle:
+            handle.write(content)
+        os.symlink(real, self.pins)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        self.assertTrue(os.path.islink(self.pins), "the link is not replaced by a plain file")
+        with open(real) as handle:
+            self.assertEqual(handle.read(), content)
+
+    def test_missing_plain_pin_path_is_first_use(self):
+        self.assertFalse(os.path.lexists(self.pins))
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out["pin"]["pinned_now"])
+
     def test_save_does_not_follow_a_planted_tmp_symlink(self):
         target = os.path.join(self.tmp.name, "victim")
         with open(target, "w") as handle:
@@ -407,6 +468,17 @@ class SentLedgerFailsClosed(Funded):
         self.assertEqual(len(self.node.published), before)
         with open(ledger) as handle:
             self.assertEqual(handle.read(), "{trunc")
+
+    def test_duplicate_key_in_sent_ledger_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        content = '{"k": "a", "k": "b"}'
+        with open(ledger, "w") as handle:
+            handle.write(content)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), out)
+        self.assertEqual(len(self.node.published), before)
 
 
 def _hash(block):
