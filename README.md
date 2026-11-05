@@ -120,6 +120,15 @@ the dry run prints the pin it compared against, and without `--pin-file` nothing
 python3 pay402.py https://seller.example/api/audit --max-xno 0.1 --pin-file ~/.nano/payto-pins.json
 ```
 
+The pin file fails closed: only a missing file means "no pins yet". A file that cannot be read, is not
+a JSON object, or holds an entry without a non-empty `pay_to` is refused (`pin-file-unreadable`,
+`pin-file-malformed`, `pin-entry-malformed`) and left untouched, so a damaged file never silently drops
+the other sellers' pins. Writes go through a unique temp file and an exclusive `flock` on `FILE.lock`
+(POSIX only), so concurrent runs do not lose each other's pins. One trailing dot on the host is the same
+origin; IDN hosts are not normalised (a Unicode host and its `xn--` form are two origins). The same
+fail-closed read now applies to the sent ledger (`ledger-unreadable` / `ledger-malformed`): reading a
+corrupt ledger as empty could pay twice. These are tested against the in-memory fake node only.
+
 ## Why this exists
 
 The swarm wrote to 501 outside agents, 139 answered, 1 transacted. The nearest

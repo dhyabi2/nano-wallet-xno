@@ -283,6 +283,132 @@ class PinPayTo(Funded):
         self.assertEqual(out["refused"], "payto-changed")
 
 
+    # -- fail closed on a damaged pin file, never rewrite it -----------------------------
+
+    def _refused_untouched(self, content, reason):
+        with open(self.pins, "w") as handle:
+            handle.write(content)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, reason), out)
+        with open(self.pins) as handle:
+            self.assertEqual(handle.read(), content, "a refused pin file is not rewritten")
+
+    def test_corrupt_pin_file_is_refused(self):
+        self._refused_untouched("{not json", "pin-file-malformed")
+
+    def test_truncated_pin_file_is_refused(self):
+        full = json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER, "first_seen": "x"}})
+        self._refused_untouched(full[: len(full) // 2], "pin-file-malformed")
+
+    def test_list_top_level_is_refused(self):
+        self._refused_untouched(json.dumps([{"pay_to": SELLER}]), "pin-file-malformed")
+
+    def test_empty_pay_to_entry_is_refused(self):
+        self._refused_untouched(json.dumps({"https://seller.example:443": {"pay_to": ""}}),
+                                "pin-entry-malformed")
+
+    def test_bare_string_entry_is_refused(self):
+        self._refused_untouched(json.dumps({"https://seller.example:443": OTHER_SELLER}),
+                                "pin-entry-malformed")
+
+    def test_malformed_entry_of_another_origin_is_refused(self):
+        self._refused_untouched(json.dumps({"https://other.example:443": 7}), "pin-entry-malformed")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads any file")
+    def test_unreadable_pin_file_is_refused(self):
+        with open(self.pins, "w") as handle:
+            json.dump({"https://other.example:443": {"pay_to": OTHER_SELLER}}, handle)
+        os.chmod(self.pins, 0)
+        self.addCleanup(os.chmod, self.pins, 0o600)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        os.chmod(self.pins, 0o600)
+        with open(self.pins) as handle:
+            self.assertIn("https://other.example:443", json.load(handle))
+
+    def test_permission_error_on_pin_file_is_refused(self):
+        # The chmod test above is skipped as root; this one injects the same OSError.
+        from unittest import mock
+        content = json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER}})
+        with open(self.pins, "w") as handle:
+            handle.write(content)
+        real_open = open
+
+        def denying_open(path, *a, **kw):
+            if path == self.pins:
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *a, **kw)
+
+        with mock.patch("builtins.open", denying_open):
+            code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        with open(self.pins) as handle:
+            self.assertEqual(handle.read(), content)
+
+    def test_directory_at_pin_path_is_refused_cleanly(self):
+        os.mkdir(self.pins)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        self.assertTrue(os.path.isdir(self.pins))
+
+    def test_bad_port_is_refused_cleanly(self):
+        for url in ("https://seller.example:99999/api/audit", "https://seller.example:abc/api/audit"):
+            code, out = self.read(SELLER, url=url)
+            self.assertEqual((code, out.get("refused")), (2, "usage"), (url, out))
+        self.assertFalse(os.path.exists(self.pins))
+
+    def test_trailing_dot_host_is_the_same_origin(self):
+        self.read(SELLER)
+        code, out = self.read(OTHER_SELLER, url="https://seller.example./api/audit")
+        self.assertEqual((code, out.get("refused")), (1, "payto-changed"), out)
+
+    def test_concurrent_first_reads_keep_every_pin(self):
+        origins = ["https://s%d.example" % i for i in range(24)]
+        errors = []
+
+        def one(origin):
+            try:
+                pay402.check_pin(self.pins, origin + "/x", SELLER)
+            except Exception as exc:                         # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=one, args=(o,)) for o in origins]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        with open(self.pins) as handle:
+            stored = json.load(handle)
+        self.assertEqual(sorted(stored), sorted(o + ":443" for o in origins))
+        leftovers = [n for n in os.listdir(self.tmp.name) if n.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_save_does_not_follow_a_planted_tmp_symlink(self):
+        target = os.path.join(self.tmp.name, "victim")
+        with open(target, "w") as handle:
+            handle.write("keep")
+        os.symlink(target, self.pins + ".tmp")
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        with open(target) as handle:
+            self.assertEqual(handle.read(), "keep")
+
+
+class SentLedgerFailsClosed(Funded):
+    def test_corrupt_sent_ledger_is_refused_before_signing(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        with open(ledger, "w") as handle:
+            handle.write("{trunc")
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), out)
+        self.assertEqual(len(self.node.published), before)
+        with open(ledger) as handle:
+            self.assertEqual(handle.read(), "{trunc")
+
+
 def _hash(block):
     return fakenode._hash_of(block)
 

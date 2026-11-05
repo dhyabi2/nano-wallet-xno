@@ -28,12 +28,19 @@ ledger file next to the key file, so a retry resubmits the SAME block instead of
 Exit codes: 0 ok, 1 refused before paying, 2 usage, 3 paid but the seller did not accept it.
 """
 import base64
+import contextlib
 import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
 import time
+
+try:
+    import fcntl
+except ImportError:                                     # pragma: no cover - not POSIX
+    fcntl = None
 
 import ed25519_blake2b as _ed
 import keystore as _keystore
@@ -164,23 +171,42 @@ def plan(url, accepts, max_xno=None):
 def check_pin(pin_path, url, pay_to, now=time.time):
     """Pin payTo per seller origin. The first read records {origin: {pay_to, first_seen}} in
     pin_path; a later read of the same origin naming another payTo raises Refused('payto-changed').
-    Returns the pin record. The file is only written on first sight of an origin."""
-    origin = nanonode.url_origin(url)
-    pins = _ledger_load(pin_path)
-    pinned = pins.get(origin)
-    if isinstance(pinned, dict) and pinned.get("pay_to"):
-        if pinned["pay_to"] != pay_to:
-            raise Refused("payto-changed",
-                          "%s named payTo %s when first read (%s), now %s: not paying. If the seller "
-                          "really moved, remove its entry from %s" % (origin, pinned["pay_to"],
-                                                                     pinned.get("first_seen"), pay_to,
-                                                                     pin_path))
-        return dict(pinned, origin=origin, pinned_now=False)
-    record = {"pay_to": pay_to,
-              "first_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))}
-    pins[origin] = record
-    _ledger_save(pin_path, pins)
-    return dict(record, origin=origin, pinned_now=True)
+    Returns the pin record. The file is only written on first sight of an origin.
+
+    Fails closed: a missing pin file is the only "no pins yet". A pin file that cannot be read,
+    is not JSON, is not a JSON object, or holds an entry that is not {"pay_to": "<non-empty>", ...}
+    is refused (pin-file-unreadable / pin-file-malformed / pin-entry-malformed) and is NOT
+    rewritten, so a damaged file never silently loses the other sellers' pins. The
+    read-check-write runs under an exclusive flock on `pin_path + ".lock"` (POSIX; where fcntl
+    does not exist the lock is skipped and concurrent writers can still race)."""
+    try:
+        origin = nanonode.url_origin(url)
+    except ValueError as exc:
+        raise Refused("usage", "cannot take the origin of %r: %s" % (url, exc)) from None
+    with _file_lock(pin_path):
+        pins = _strict_load(pin_path, "pin-file")
+        for key, value in pins.items():
+            if not (isinstance(value, dict) and isinstance(value.get("pay_to"), str)
+                    and value["pay_to"]):
+                raise Refused("pin-entry-malformed",
+                              "pin file %s: the entry for %r is not {\"pay_to\": ...}; fix or "
+                              "remove it by hand: not paying" % (pin_path, key))
+        pinned = pins.get(origin)
+        if pinned is not None:
+            if pinned["pay_to"] != pay_to:
+                raise Refused("payto-changed",
+                              "%s named payTo %s when first read (%s), now %s: not paying. If the "
+                              "seller really moved, remove its entry from %s"
+                              % (origin, pinned["pay_to"], pinned.get("first_seen"), pay_to, pin_path))
+            return dict(pinned, origin=origin, pinned_now=False)
+        record = {"pay_to": pay_to,
+                  "first_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))}
+        pins[origin] = record
+        try:
+            _ledger_save(pin_path, pins)
+        except OSError as exc:
+            raise Refused("pin-file-unwritable", "cannot write pin file %s: %s" % (pin_path, exc)) from None
+        return dict(record, origin=origin, pinned_now=True)
 
 
 # ------------------------------------------------------------- binding sig
@@ -210,21 +236,66 @@ def payment_header(block_hash, entry, private_key=None):
 
 # ------------------------------------------------------------------- pay
 
-def _ledger_load(path):
+def _strict_load(path, what):
+    """The JSON object at path; {} ONLY when the file does not exist. Anything else that is
+    wrong (unreadable, a directory, not JSON, not an object) raises Refused('<what>-unreadable'
+    or '<what>-malformed'): an empty reading of a damaged file would forget what it held."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+            text = handle.read()
+    except FileNotFoundError:
         return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Refused(what + "-unreadable", "cannot read %s: %s: not paying" % (path, exc)) from None
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise Refused(what + "-malformed", "%s is not valid JSON (%s): fix or remove it by hand: "
+                      "not paying" % (path, exc)) from None
+    if not isinstance(data, dict):
+        raise Refused(what + "-malformed", "%s holds a JSON %s, not an object: fix or remove it "
+                      "by hand: not paying" % (path, type(data).__name__))
+    return data
+
+
+def _ledger_load(path):
+    """The sent ledger. Same fail-closed rule as the pin file: an unreadable or corrupt ledger
+    read as empty would forget a block already sent and could pay twice."""
+    return _strict_load(path, "ledger")
+
+
+@contextlib.contextmanager
+def _file_lock(path):
+    """Exclusive flock on path + '.lock' (POSIX). Without fcntl it is a no-op."""
+    if fcntl is None:
+        yield
+        return
+    try:
+        fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise Refused("pin-file-unwritable", "cannot open lock file %s.lock: %s" % (path, exc)) from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _ledger_save(path, sent):
-    temp = path + ".tmp"
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(sent, handle)
-    os.replace(temp, path)
+    """Atomic replace through a unique temp file in the same directory (mkstemp: O_EXCL, 0600,
+    so a planted symlink at a predictable name is never followed)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temp = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(sent, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
 
 
 def idempotency_key(url, pay_to, raw):

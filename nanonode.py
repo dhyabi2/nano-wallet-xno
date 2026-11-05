@@ -183,12 +183,16 @@ def url_scheme(url: str) -> str:
 
 
 def url_origin(url: str) -> str:
-    """scheme://host:port, lower-cased, default port made explicit, credentials dropped
-    (pay402's per-seller payTo pin key)."""
+    """scheme://host:port, lower-cased, default port made explicit, credentials dropped, one
+    trailing dot of a fully-qualified host removed (pay402's per-seller payTo pin key).
+    Raises ValueError for an out-of-range or non-numeric port. IDN hosts are NOT normalised:
+    a Unicode host and its xn-- punycode spelling are two origins."""
     parts = urllib.parse.urlsplit(url)
     scheme = parts.scheme.lower()
     port = parts.port or {"http": 80, "https": 443}.get(scheme)
     host = (parts.hostname or "").lower()
+    if host.endswith(".") and not host.endswith(".."):
+        host = host[:-1]
     if ":" in host:
         host = "[%s]" % host
     return "%s://%s:%s" % (scheme, host, port)
