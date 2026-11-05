@@ -182,6 +182,18 @@ def url_scheme(url: str) -> str:
     return urllib.parse.urlsplit(url).scheme
 
 
+def url_origin(url: str) -> str:
+    """scheme://host:port, lower-cased, default port made explicit, credentials dropped
+    (pay402's per-seller payTo pin key)."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    port = parts.port or {"http": 80, "https": 443}.get(scheme)
+    host = (parts.hostname or "").lower()
+    if ":" in host:
+        host = "[%s]" % host
+    return "%s://%s:%s" % (scheme, host, port)
+
+
 def host_of(url: str) -> str:
     """The host of a node URL, with any credentials stripped.
 

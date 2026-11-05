@@ -3,6 +3,7 @@
     nano-pay402 https://seller.example/api/audit                      # DRY RUN: show what would be paid
     nano-pay402 URL --max-xno 0.1                                     # dry run, also checks the cap
     nano-pay402 URL --pay --key-file ~/.nano/key --max-xno 0.1        # really pay (needs a funded key file)
+    nano-pay402 URL --pin-file ~/.nano/payto-pins.json                # refuse if payTo changed since the last read
 
 What it does, in order, and stops at the first thing that is wrong:
 
@@ -11,6 +12,9 @@ What it does, in order, and stops at the first thing that is wrong:
      one you named is not a price you agreed to.
   2. Picks the `nano:mainnet` / `nano-mainnet` entry. Refuses if there is none.
   3. Checks `payTo` against its checksum and the price as an integer count of raw (no floats).
+  3b. With --pin-file, compares payTo with the one this seller's origin (scheme+host+port) named
+     the first time it was read; a different payTo is refused as `payto-changed`. The first read
+     records it. Without --pin-file nothing is compared.
   4. Compares the price with --max-xno. Paying REQUIRES --max-xno: an unbounded buyer is not built.
   5. Without --pay it prints that plan as JSON and exits 0. Nothing was signed, no key was read.
   6. With --pay it signs ONE send block locally with your key file (the key never leaves this
@@ -155,6 +159,30 @@ def plan(url, accepts, max_xno=None):
     return out, entry
 
 
+# ------------------------------------------------------------- payTo pin
+
+def check_pin(pin_path, url, pay_to, now=time.time):
+    """Pin payTo per seller origin. The first read records {origin: {pay_to, first_seen}} in
+    pin_path; a later read of the same origin naming another payTo raises Refused('payto-changed').
+    Returns the pin record. The file is only written on first sight of an origin."""
+    origin = nanonode.url_origin(url)
+    pins = _ledger_load(pin_path)
+    pinned = pins.get(origin)
+    if isinstance(pinned, dict) and pinned.get("pay_to"):
+        if pinned["pay_to"] != pay_to:
+            raise Refused("payto-changed",
+                          "%s named payTo %s when first read (%s), now %s: not paying. If the seller "
+                          "really moved, remove its entry from %s" % (origin, pinned["pay_to"],
+                                                                     pinned.get("first_seen"), pay_to,
+                                                                     pin_path))
+        return dict(pinned, origin=origin, pinned_now=False)
+    record = {"pay_to": pay_to,
+              "first_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))}
+    pins[origin] = record
+    _ledger_save(pin_path, pins)
+    return dict(record, origin=origin, pinned_now=True)
+
+
 # ------------------------------------------------------------- binding sig
 
 def binding_message(block_hash, nonce, resource, pay_to):
@@ -276,6 +304,7 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
         method = _opt(args, "--method", "GET").upper()
         data = _opt(args, "--data")
         ledger = _opt(args, "--ledger")
+        pin_file = _opt(args, "--pin-file")
         if len(args) != 1 or args[0].startswith("--"):
             raise Refused("usage", "expected exactly one URL, got %r" % args)
         url = args[0]
@@ -286,6 +315,10 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
                                             headers={"Content-Type": "application/json"} if body else {})
         accepts = read_accepts(status, headers, response)
         summary, entry = plan(url, accepts, max_xno)
+        if pin_file:
+            pin = check_pin(os.path.expanduser(pin_file), url, summary["pay_to"])
+            summary["pin"] = {"origin": pin["origin"], "pay_to": pin["pay_to"],
+                              "first_seen": pin["first_seen"], "pinned_now": pin["pinned_now"]}
         if not do_pay:
             summary["dry_run"] = True
             summary["next"] = ("add --pay --key-file FILE --max-xno %s to pay" % summary["amount_xno"]
@@ -299,6 +332,8 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
                           "mode 600; make one with `python3 nano_keygen.py new --key-file FILE`)")
         node = node or nanonode.HttpNanoNode(node_url)
         result = pay(url, entry, summary, key_file, max_xno, node, method, body, ledger, fetcher, sleep)
+        if "pin" in summary:
+            result["pin"] = summary["pin"]
         out(result)
         return 0 if 200 <= result["seller_status"] < 300 else 3
     except Refused as exc:

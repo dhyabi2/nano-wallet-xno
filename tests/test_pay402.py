@@ -217,6 +217,72 @@ class Paying(Funded):
         self.assertEqual((code, out["refused"]), (1, "insufficient_balance"))
 
 
+OTHER_SELLER = nanoaddr.encode(ed.public_key_from_private(bytes.fromhex("44" * 32)))
+
+
+class PinPayTo(Funded):
+    """--pin-file: a seller's origin keeps the payTo it named on first read."""
+
+    def setUp(self):
+        super().setUp()
+        self.pins = os.path.join(self.tmp.name, "pins.json")
+
+    def read(self, pay_to, url=URL, pins=True):
+        return run([url, "--max-xno", "0.1"] + (["--pin-file", self.pins] if pins else []),
+                   Seller(challenge(entry(payTo=pay_to))))
+
+    def test_first_read_pins_the_pay_to(self):
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["pin"]["origin"], out["pin"]["pay_to"], out["pin"]["pinned_now"]),
+                         ("https://seller.example:443", SELLER, True))
+        with open(self.pins) as handle:
+            stored = json.load(handle)
+        self.assertEqual(stored["https://seller.example:443"]["pay_to"], SELLER)
+        self.assertIn("first_seen", stored["https://seller.example:443"])
+        self.assertEqual(stat.S_IMODE(os.stat(self.pins).st_mode), 0o600)
+
+    def test_same_pay_to_passes(self):
+        self.read(SELLER)
+        code, out = self.read(SELLER, url="https://SELLER.example:443/api/other")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["pin"]["pinned_now"])
+
+    def test_changed_pay_to_is_refused(self):
+        self.read(SELLER)
+        code, out = self.read(OTHER_SELLER, url="https://seller.example/api/other")
+        self.assertEqual((code, out["refused"]), (1, "payto-changed"), out)
+        self.assertIn(SELLER, out["message"])
+        self.assertIn(OTHER_SELLER, out["message"])
+        with open(self.pins) as handle:
+            self.assertEqual(json.load(handle)["https://seller.example:443"]["pay_to"], SELLER,
+                             "a refused read does not move the pin")
+
+    def test_changed_pay_to_is_refused_before_paying(self):
+        self.read(SELLER)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--pin-file", self.pins], Seller(challenge(entry(payTo=OTHER_SELLER))), self.node)
+        self.assertEqual((code, out["refused"]), (1, "payto-changed"), out)
+        self.assertEqual([b for b in self.node.published
+                          if b["link"] == nanoaddr.decode(OTHER_SELLER).hex().upper()], [])
+
+    def test_without_pin_file_nothing_is_compared(self):
+        self.read(SELLER)
+        code, out = self.read(OTHER_SELLER, pins=False)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("pin", out)
+
+    def test_the_pin_is_per_origin(self):
+        self.read(SELLER)
+        for other in ("https://other.example/api/audit", "http://seller.example/api/audit",
+                      "https://seller.example:8443/api/audit"):
+            code, out = self.read(OTHER_SELLER, url=other)
+            self.assertEqual(code, 0, (other, out))
+            self.assertTrue(out["pin"]["pinned_now"], other)
+        code, out = self.read(OTHER_SELLER)
+        self.assertEqual(out["refused"], "payto-changed")
+
+
 def _hash(block):
     return fakenode._hash_of(block)
 

@@ -111,6 +111,15 @@ re-run after a failure resubmits the SAME block instead of paying twice. If the 
 that paid. `tests/test_pay402.py` runs the whole flow against an in-memory node; a real payment was NOT
 run from this repository's tests, only the dry run is meant to be tried first.
 
+`--pin-file FILE` pins `payTo` per seller origin (scheme, host and port): the first read records the
+address and when it was first seen in that JSON file, and a later read of the same origin that names a
+different `payTo` is refused as `payto-changed` before anything is signed. Another host is not affected,
+the dry run prints the pin it compared against, and without `--pin-file` nothing is compared:
+
+```
+python3 pay402.py https://seller.example/api/audit --max-xno 0.1 --pin-file ~/.nano/payto-pins.json
+```
+
 ## Why this exists
 
 The swarm wrote to 501 outside agents, 139 answered, 1 transacted. The nearest
