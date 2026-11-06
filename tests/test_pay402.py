@@ -352,6 +352,30 @@ class PinPayTo(Funded):
         self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
         self.assertTrue(os.path.isdir(self.pins))
 
+    def test_zero_byte_pin_file_says_empty_and_names_the_path(self):
+        open(self.pins, "w").close()
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-malformed"), out)
+        self.assertIn("empty", out["message"])
+        self.assertIn("remove it", out["message"])
+        self.assertIn(self.pins, out["message"])
+        self.assertTrue(os.path.exists(self.pins), "an empty pin file is not auto-deleted")
+        self.assertEqual(os.path.getsize(self.pins), 0)
+
+    def test_pin_file_in_missing_directory_is_refused_and_leaves_nothing(self):
+        missing = os.path.join(self.tmp.name, "no-such-dir")
+        self.pins = os.path.join(missing, "pins.json")
+        before = sorted(os.listdir(self.tmp.name))
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.tmp.name)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unwritable"), out)
+        self.assertIn("does not exist", out["message"])
+        self.assertIn(missing, out["message"])
+        self.assertFalse(os.path.exists(missing), "the directory is not created")
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), before, "no stray .lock or temp file")
+
     def test_bad_port_is_refused_cleanly(self):
         for url in ("https://seller.example:99999/api/audit", "https://seller.example:abc/api/audit"):
             code, out = self.read(SELLER, url=url)

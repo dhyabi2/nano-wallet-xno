@@ -14,7 +14,9 @@ What it does, in order, and stops at the first thing that is wrong:
   3. Checks `payTo` against its checksum and the price as an integer count of raw (no floats).
   3b. With --pin-file, compares payTo with the one this seller's origin (scheme+host+port) named
      the first time it was read; a different payTo is refused as `payto-changed`. The first read
-     records it. Without --pin-file nothing is compared.
+     records it. Without --pin-file nothing is compared. The directory holding the pin file must
+     already exist (it is not created; a missing one is refused as `pin-file-unwritable` and
+     leaves nothing behind). An empty pin file is refused as `pin-file-malformed`: remove it.
   4. Compares the price with --max-xno. Paying REQUIRES --max-xno: an unbounded buyer is not built.
   5. Without --pay it prints that plan as JSON and exits 0. Nothing was signed, no key was read.
   6. With --pay it signs ONE send block locally with your key file (the key never leaves this
@@ -176,13 +178,19 @@ def check_pin(pin_path, url, pay_to, now=time.time):
     Fails closed: a missing pin file is the only "no pins yet". A pin file that cannot be read,
     is a symlink, is not JSON, repeats a key, is not a JSON object, or holds an entry that is not
     {"pay_to": "<non-empty>", "first_seen": "<non-empty>", ...} is refused (pin-file-unreadable / pin-file-malformed / pin-entry-malformed) and is NOT
-    rewritten, so a damaged file never silently loses the other sellers' pins. The
+    rewritten (an empty file says so and names the path to remove; it is never auto-deleted), so a damaged file never silently loses the other sellers' pins. The
     read-check-write runs under an exclusive flock on `pin_path + ".lock"` (POSIX; where fcntl
     does not exist the lock is skipped and concurrent writers can still race)."""
     try:
         origin = nanonode.url_origin(url)
     except ValueError as exc:
         raise Refused("usage", "cannot take the origin of %r: %s" % (url, exc)) from None
+    directory = os.path.dirname(os.path.abspath(pin_path))
+    if not os.path.isdir(directory):
+        # Checked before the lock: opening FILE.lock would otherwise be the first thing to touch
+        # the path, and nothing is created for a pin file that cannot be kept.
+        raise Refused("pin-file-unwritable", "the directory %s for pin file %s does not exist; "
+                      "create it first (nothing was created): not paying" % (directory, pin_path))
     with _file_lock(pin_path):
         if os.path.islink(pin_path):
             # A dangling link would read as "no pins yet" (every seller trusted fresh) and the
@@ -268,6 +276,12 @@ def _strict_load(path, what, nofollow=False):
         return {}
     except (OSError, UnicodeDecodeError) as exc:
         raise Refused(what + "-unreadable", "cannot read %s: %s: not paying" % (path, exc)) from None
+    if what == "pin-file" and not text.strip():
+        # A 0-byte pin file (an older version could leave one after a crash) is corrupt, not
+        # "no pins yet". It is not deleted here: say so plainly and let the user remove it.
+        raise Refused(what + "-malformed", "pin file %s is empty (0 bytes or only whitespace), so "
+                      "it is corrupt and holds no pins; if you have no pins to keep, remove it "
+                      "(rm %s) and run again: not paying" % (path, path))
     try:
         data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except (ValueError, RecursionError) as exc:

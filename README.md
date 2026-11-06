@@ -125,7 +125,11 @@ symlink (even a dangling one), is not a JSON object, repeats a key, or holds an 
 `pay_to` and `first_seen` is refused (`pin-file-unreadable`, `pin-file-malformed`, `pin-entry-malformed`)
 and left untouched, so a damaged file never silently drops
 the other sellers' pins. Writes go through a unique temp file and an exclusive `flock` on `FILE.lock`
-(POSIX only), so concurrent runs do not lose each other's pins. An empty `--pin-file ""` is a usage error, never "pinning off". One trailing dot on the host is the same
+(POSIX only), so concurrent runs do not lose each other's pins. The directory that holds `FILE` must
+already exist: it is not created, and a missing one is refused as `pin-file-unwritable` before anything
+(not even `FILE.lock`) is written. A 0-byte pin file (an older version could leave one after a crash)
+is refused as `pin-file-malformed` with a message that says it is empty and names the path; it is never
+deleted for you, so remove it yourself if you have no pins to keep. An empty `--pin-file ""` is a usage error, never "pinning off". One trailing dot on the host is the same
 origin; IDN hosts are not normalised (a Unicode host and its `xn--` form are two origins). The same
 fail-closed read now applies to the sent ledger (`ledger-unreadable` / `ledger-malformed`): reading a
 corrupt ledger as empty could pay twice. These are tested against the in-memory fake node only.
