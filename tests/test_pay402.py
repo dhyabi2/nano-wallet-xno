@@ -376,6 +376,40 @@ class PinPayTo(Funded):
         self.assertFalse(os.path.exists(missing), "the directory is not created")
         self.assertEqual(sorted(os.listdir(self.tmp.name)), before, "no stray .lock or temp file")
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_fifo_at_pin_path_is_refused_without_hanging(self):
+        os.mkfifo(self.pins)
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(zip(("code", "out"), self.read(SELLER))),
+                                  daemon=True)
+        worker.start()
+        worker.join(10)
+        if worker.is_alive():
+            # Unblock the hung reader so the test process can finish, then fail.
+            with open(self.pins, "w"):
+                pass
+            worker.join(5)
+            self.fail("a FIFO pin file blocked the read while holding FILE.lock")
+        self.assertEqual((result["code"], result["out"].get("refused")), (1, "pin-file-unreadable"),
+                         result)
+        self.assertIn("not a regular file", result["out"]["message"])
+        # The lock was released: a second check on another path through the same lock works.
+        with pay402._file_lock(self.pins):
+            pass
+
+    def test_nul_in_pin_path_is_a_clean_refusal(self):
+        with self.assertRaises(pay402.Refused) as caught:
+            pay402.check_pin(self.pins + "\0x", URL, SELLER)
+        self.assertEqual(caught.exception.reason, "pin-file-unreadable")
+
+    def test_docs_do_not_blame_an_older_version_for_empty_pin_files(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("pay402.py", "README.md"):
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                text = " ".join(handle.read().split())
+            self.assertNotIn("older version could leave", text, name)
+            self.assertIn("empty pin file (e.g. after a crash) holds no pins", text, name)
+
     def test_bad_port_is_refused_cleanly(self):
         for url in ("https://seller.example:99999/api/audit", "https://seller.example:abc/api/audit"):
             code, out = self.read(SELLER, url=url)
@@ -527,6 +561,24 @@ class SentLedgerFailsClosed(Funded):
         self.assertEqual(len(self.node.published), before)
         with open(ledger) as handle:
             self.assertEqual(handle.read(), "{trunc")
+
+    def test_corrupt_sent_ledger_message_never_says_remove(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ("{trunc", "[]", ""):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (content, out))
+            message = out["message"]
+            self.assertIn("do NOT delete it", message, content)
+            self.assertIn("backup", message, content)
+            self.assertNotIn("remove", message, content)
+            self.assertNotIn("rm ", message, content)
+            if not content:
+                self.assertIn("empty", message)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content)
 
     def test_duplicate_key_in_sent_ledger_is_refused(self):
         ledger = self.key_file + ".pay402-sent.json"

@@ -16,7 +16,9 @@ What it does, in order, and stops at the first thing that is wrong:
      the first time it was read; a different payTo is refused as `payto-changed`. The first read
      records it. Without --pin-file nothing is compared. The directory holding the pin file must
      already exist (it is not created; a missing one is refused as `pin-file-unwritable` and
-     leaves nothing behind). An empty pin file is refused as `pin-file-malformed`: remove it.
+     leaves nothing behind). An empty pin file (e.g. after a crash) holds no pins and is refused as
+     `pin-file-malformed`: remove it. A pin file that is not a regular file (a FIFO, device...)
+     is refused as `pin-file-unreadable`.
   4. Compares the price with --max-xno. Paying REQUIRES --max-xno: an unbounded buyer is not built.
   5. Without --pay it prints that plan as JSON and exits 0. Nothing was signed, no key was read.
   6. With --pay it signs ONE send block locally with your key file (the key never leaves this
@@ -35,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -185,6 +188,9 @@ def check_pin(pin_path, url, pay_to, now=time.time):
         origin = nanonode.url_origin(url)
     except ValueError as exc:
         raise Refused("usage", "cannot take the origin of %r: %s" % (url, exc)) from None
+    if "\0" in pin_path:
+        raise Refused("pin-file-unreadable", "pin file path %r contains a NUL byte: not paying"
+                      % pin_path)
     directory = os.path.dirname(os.path.abspath(pin_path))
     if not os.path.isdir(directory):
         # Checked before the lock: opening FILE.lock would otherwise be the first thing to touch
@@ -267,29 +273,51 @@ def _strict_load(path, what, nofollow=False):
     raises Refused('<what>-unreadable' or '<what>-malformed'): an empty reading of a damaged file
     would forget what it held. With nofollow the open uses O_NOFOLLOW (where the OS has it), so
     a symlink swapped in after an islink() check is refused (ELOOP) rather than followed."""
-    flags = os.O_RDONLY | (getattr(os, "O_NOFOLLOW", 0) if nofollow else 0)
+    # O_NONBLOCK so a FIFO opens at once instead of blocking (while FILE.lock is held) until a
+    # writer appears; the fstat below then refuses anything that is not a regular file.
+    flags = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+             | (getattr(os, "O_NOFOLLOW", 0) if nofollow else 0))
+    # The sent ledger records blocks already sent: deleting it could make a retry sign a NEW
+    # block and pay twice, so its advice never says remove. The pin file can be removed.
+    if what == "ledger":
+        advice = ("restore it from a backup or fix it by hand; do NOT delete it - it records "
+                  "blocks already sent")
+    else:
+        advice = "fix or remove it by hand"
     try:
         fd = os.open(path, flags)
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Refused(what + "-unreadable", "%s is not a regular file (a FIFO, device, "
+                              "socket or directory?): not paying" % path)
+            handle = os.fdopen(fd, "r", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
             text = handle.read()
     except FileNotFoundError:
         return {}
-    except (OSError, UnicodeDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        # ValueError: a path with an embedded NUL byte.
         raise Refused(what + "-unreadable", "cannot read %s: %s: not paying" % (path, exc)) from None
-    if what == "pin-file" and not text.strip():
-        # A 0-byte pin file (an older version could leave one after a crash) is corrupt, not
-        # "no pins yet". It is not deleted here: say so plainly and let the user remove it.
-        raise Refused(what + "-malformed", "pin file %s is empty (0 bytes or only whitespace), so "
-                      "it is corrupt and holds no pins; if you have no pins to keep, remove it "
-                      "(rm %s) and run again: not paying" % (path, path))
+    if not text.strip():
+        if what == "pin-file":
+            # An empty pin file (e.g. after a crash) holds no pins but is not "no pins yet":
+            # it is not deleted here; say so plainly and let the user remove it.
+            raise Refused(what + "-malformed", "pin file %s is empty (0 bytes or only whitespace), "
+                          "so it is corrupt and holds no pins; if you have no pins to keep, remove "
+                          "it (rm %s) and run again: not paying" % (path, path))
+        raise Refused(what + "-malformed", "%s is empty (0 bytes or only whitespace), so it is "
+                      "corrupt: %s: not paying" % (path, advice))
     try:
         data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except (ValueError, RecursionError) as exc:
-        raise Refused(what + "-malformed", "%s is not valid JSON (%s): fix or remove it by hand: "
-                      "not paying" % (path, exc)) from None
+        raise Refused(what + "-malformed", "%s is not valid JSON (%s): %s: not paying"
+                      % (path, exc, advice)) from None
     if not isinstance(data, dict):
-        raise Refused(what + "-malformed", "%s holds a JSON %s, not an object: fix or remove it "
-                      "by hand: not paying" % (path, type(data).__name__))
+        raise Refused(what + "-malformed", "%s holds a JSON %s, not an object: %s: not paying"
+                      % (path, type(data).__name__, advice))
     return data
 
 
