@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 import tempfile
@@ -308,8 +309,15 @@ def _strict_load(path, what, nofollow=False):
             raise Refused(what + "-malformed", "pin file %s is empty (0 bytes or only whitespace), "
                           "so it is corrupt and holds no pins; if you have no pins to keep, remove "
                           "it (rm %s) and run again: not paying" % (path, path))
-        raise Refused(what + "-malformed", "%s is empty (0 bytes or only whitespace), so it is "
-                      "corrupt: %s: not paying" % (path, advice))
+        # An empty sent ledger is usually a crash before the first write, but it may also be a
+        # truncated one that lost blocks already sent. Name the exact recovery: only the user
+        # knows whether a payment was recorded in it.
+        raise Refused(what + "-malformed", "sent ledger %s is empty (0 bytes or only whitespace), "
+                      "so it is corrupt and pay402 cannot tell which blocks were already sent; if "
+                      "you are sure no payment was recorded in it, write {} into it (printf '{}' > "
+                      "%s) and run again; otherwise restore it from a backup; do NOT delete it - "
+                      "an absent ledger could make a retry pay twice: not paying"
+                      % (path, shlex.quote(path)))
     try:
         data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except (ValueError, RecursionError) as exc:

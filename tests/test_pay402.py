@@ -580,6 +580,43 @@ class SentLedgerFailsClosed(Funded):
             with open(ledger) as handle:
                 self.assertEqual(handle.read(), content)
 
+    def test_empty_sent_ledger_message_names_the_brace_recovery(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ("", "  \n\t"):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (content, out))
+            self.assertEqual(len(self.node.published), before)
+            message = out["message"]
+            self.assertIn("write {} into it", message, content)
+            self.assertIn("sure no payment was recorded", message, content)
+            self.assertIn(ledger, message, content)
+            self.assertIn("do NOT delete it", message, content)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content, "the ledger is never rewritten for you")
+
+    def test_non_empty_corrupt_sent_ledger_does_not_suggest_braces(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ("{trunc", "[]"):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual(out.get("refused"), "ledger-malformed", out)
+            self.assertNotIn("{}", out["message"], content)
+            self.assertIn("do NOT delete it", out["message"], content)
+
+    def test_readme_flags_the_sent_ledger_behaviour_change(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "README.md"), encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("### Upgrading: a damaged sent ledger now stops --pay", text)
+        self.assertIn("even without `--pin-file`", text)
+        self.assertIn("write `{}` into it", text)
+
     def test_duplicate_key_in_sent_ledger_is_refused(self):
         ledger = self.key_file + ".pay402-sent.json"
         content = '{"k": "a", "k": "b"}'

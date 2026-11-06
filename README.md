@@ -136,6 +136,20 @@ fail-closed read now applies to the sent ledger (`ledger-unreadable` / `ledger-m
 corrupt ledger as empty could pay twice. Unlike the pin file, a damaged or empty sent ledger must NOT be
 deleted: it records blocks already sent, so restore it from a backup or fix it by hand. These are tested against the in-memory fake node only.
 
+### Upgrading: a damaged sent ledger now stops --pay
+
+This is a behaviour change for everyone who runs `pay402.py --pay`, even without `--pin-file`. The sent
+ledger (`KEY_FILE.pay402-sent.json` unless you move it) used to be read as empty when it was 0 bytes,
+only whitespace, not JSON or not a JSON object, and the payment went ahead. It is now refused
+(`ledger-malformed` or `ledger-unreadable`, exit 1) before anything is signed. Why: the ledger is how a
+retry knows a block was already sent, so a lost or blanked ledger read as "nothing sent" can mean paying
+the same seller twice. A missing ledger is still fine (it means nothing has been sent yet). To recover:
+
+- Empty file (0 bytes or only whitespace): if you are sure no payment was recorded in it,
+  write `{}` into it (`printf '{}' > ~/.nano/key.json.pay402-sent.json`, with your own path) and run again. If you are not
+  sure, restore it from a backup.
+- Any other damage: restore it from a backup or fix the JSON by hand. Do NOT delete it.
+
 ## Why this exists
 
 The swarm wrote to 501 outside agents, 139 answered, 1 transacted. The nearest
