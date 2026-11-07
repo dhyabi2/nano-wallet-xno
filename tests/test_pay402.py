@@ -641,6 +641,60 @@ class SentLedgerFailsClosed(Funded):
         with open(ledger) as handle:
             self.assertEqual(handle.read(), content)
 
+    def test_sent_ledger_entry_that_is_not_an_object_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ('{"a": 1}', '{"a": []}', '{"a": "x"}', '{"a": null}'):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (content, out))
+            self.assertEqual(len(self.node.published), before, content)
+            self.assertIn(ledger, out["message"], content)
+            self.assertIn("do NOT delete it", out["message"], content)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
+    def test_dangling_symlink_sent_ledger_is_refused_before_signing(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        target = os.path.join(os.path.dirname(ledger), "gone.json")
+        os.symlink(target, ledger)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unreadable"), out)
+        self.assertEqual(len(self.node.published), before, "nothing is signed or published")
+        self.assertIn(ledger, out["message"])
+        self.assertIn("dangling", out["message"])
+        self.assertTrue(os.path.islink(ledger), "the link is left as it was")
+        self.assertFalse(os.path.lexists(target))
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
+    def test_symlink_to_a_valid_sent_ledger_is_still_read(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        real = os.path.join(os.path.dirname(ledger), "real-ledger.json")
+        with open(real, "w") as handle:
+            handle.write("{}")
+        os.symlink(real, ledger)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+        self.assertEqual(len(self.node.published), before + 1)
+
+    def test_missing_sent_ledger_on_first_use_still_pays(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        self.assertFalse(os.path.lexists(ledger))
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+        self.assertEqual(len(self.node.published), before + 1)
+        with open(ledger) as handle:
+            self.assertEqual(len(json.load(handle)), 1)
+
 
 def _hash(block):
     return fakenode._hash_of(block)

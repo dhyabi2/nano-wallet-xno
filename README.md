@@ -143,7 +143,7 @@ ledger (`KEY_FILE.pay402-sent.json` unless you move it) used to be read as empty
 only whitespace, not JSON or not a JSON object, and the payment went ahead. It is now refused
 (`ledger-malformed` or `ledger-unreadable`, exit 1) before anything is signed. Why: the ledger is how a
 retry knows a block was already sent, so a lost or blanked ledger read as "nothing sent" can mean paying
-the same seller twice. A missing ledger is still fine (it means nothing has been sent yet). To recover:
+the same seller twice. A missing ledger is still fine (it means nothing has been sent yet), but a dangling symlink at the ledger path is not missing: it is refused as `ledger-unreadable` naming the path, so point the link at the real ledger or restore it. A ledger entry that is not a JSON object (e.g. `{"a": 1}`) is refused as `ledger-malformed`. A symlink to an existing ledger file is read as before. To recover:
 
 - Empty file (0 bytes or only whitespace): if you are sure no payment was recorded in it,
   write `{}` into it (`printf '{}' > ~/.nano/key.json.pay402-sent.json`, with your own path) and run again. If you are not

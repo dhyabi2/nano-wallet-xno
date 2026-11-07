@@ -269,7 +269,8 @@ def _no_duplicate_keys(pairs):
 
 
 def _strict_load(path, what, nofollow=False):
-    """The JSON object at path; {} ONLY when the file does not exist. Anything else that is
+    """The JSON object at path; {} ONLY when the file does not exist (for the sent ledger, not
+    when the path is a dangling symlink, and every ledger entry must itself be an object). Anything else that is
     wrong (unreadable, a directory, not JSON, a repeated key, too deeply nested, not an object)
     raises Refused('<what>-unreadable' or '<what>-malformed'): an empty reading of a damaged file
     would forget what it held. With nofollow the open uses O_NOFOLLOW (where the OS has it), so
@@ -298,6 +299,18 @@ def _strict_load(path, what, nofollow=False):
         with handle:
             text = handle.read()
     except FileNotFoundError:
+        if what == "ledger" and os.path.islink(path):
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = "?"
+            # A dangling symlink is not "no ledger yet": reading it as empty would sign a new
+            # block, and the save afterwards would replace the link, so a retry could pay twice.
+            raise Refused(what + "-unreadable", "sent ledger %s is a dangling symlink (it points "
+                          "to %s, which does not exist), so pay402 cannot tell which blocks were "
+                          "already sent; point the link at the real ledger or restore it from a "
+                          "backup; do NOT delete it: not paying"
+                          % (path, target)) from None
         return {}
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         # ValueError: a path with an embedded NUL byte.
@@ -326,6 +339,12 @@ def _strict_load(path, what, nofollow=False):
     if not isinstance(data, dict):
         raise Refused(what + "-malformed", "%s holds a JSON %s, not an object: %s: not paying"
                       % (path, type(data).__name__, advice))
+    if what == "ledger":
+        # Every entry is one payment's record; payments.send reads each one as an object.
+        for key, record in data.items():
+            if not isinstance(record, dict):
+                raise Refused(what + "-malformed", "%s entry %r holds a JSON %s, not an object: "
+                              "%s: not paying" % (path, key, type(record).__name__, advice))
     return data
 
 
