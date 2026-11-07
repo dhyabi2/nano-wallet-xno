@@ -733,6 +733,88 @@ class SentLedgerFailsClosed(Funded):
         self.assertEqual(len(self.node.published), before + 1)
         self.assertTrue(os.path.isfile(ledger))
 
+    def _pay_with_ledger(self, ledger):
+        return run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                    "--ledger", ledger], Seller(challenge(entry())), self.node)
+
+    def test_ledger_path_through_a_missing_directory_and_dotdot_is_refused(self):
+        base = os.path.dirname(self.key_file)
+        ledger = os.path.join(base, "missing", "..", "l.json")
+        before = len(self.node.published)
+        code, out = self._pay_with_ledger(ledger)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), out)
+        self.assertEqual(len(self.node.published), before, "nothing is signed or published")
+        self.assertIn(ledger, out["message"])
+        # A retry is refused the same way: it never pays a second time.
+        code, out = self._pay_with_ledger(ledger)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), out)
+        self.assertEqual(len(self.node.published), before)
+        self.assertFalse(os.path.lexists(os.path.join(base, "l.json")))
+
+    def test_ledger_path_ending_in_a_separator_is_refused(self):
+        base = os.path.dirname(self.key_file)
+        for ledger in (os.path.join(base, "nope") + os.sep, base + os.sep):
+            before = len(self.node.published)
+            code, out = self._pay_with_ledger(ledger)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), (ledger, out))
+            self.assertEqual(len(self.node.published), before, ledger)
+            self.assertIn(ledger, out["message"])
+        self.assertFalse(os.path.lexists(os.path.join(base, "nope")))
+
+    def test_ledger_save_failure_after_publishing_says_paid_and_prints_the_record(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        before = len(self.node.published)
+        with mock.patch.object(pay402.os, "replace", side_effect=OSError(28, "No space left on device")):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unsaved"), out)
+        self.assertEqual(len(self.node.published), before + 1, "the payment was published")
+        block_hash = _hash(self.node.published[-1])
+        self.assertEqual(out.get("block_hash"), block_hash, out)
+        self.assertIn(block_hash, out["message"])
+        self.assertIn("WAS published", out["message"])
+        self.assertIn("do NOT retry", out["message"])
+        self.assertIn(ledger, out["message"])
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        record = out["unsaved_record"]
+        self.assertEqual(list(record), [key])
+        self.assertEqual(record[key]["block_hash"], block_hash)
+        self.assertFalse(os.path.exists(ledger))
+        self.assertEqual([n for n in os.listdir(os.path.dirname(ledger)) if n.endswith(".tmp")], [])
+
+    def test_wrong_shape_entry_under_this_payments_key_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        shapes = [
+            {},
+            {"to": SELLER},
+            {"amount_raw": PRICE},
+            {"to": SELLER, "amount_raw": str(PRICE)},
+            {"to": SELLER, "amount_raw": True, "result": None},
+            {"to": 5, "amount_raw": PRICE, "result": None},
+            {"to": SELLER, "amount_raw": PRICE, "result": "bad"},
+            {"to": SELLER, "amount_raw": PRICE, "result": {}},
+            {"to": SELLER, "amount_raw": PRICE, "result": {"block_hash": 7}},
+            {"to": SELLER, "amount_raw": PRICE, "result": None, "block_hash": 5},
+            {"to": SELLER, "amount_raw": PRICE, "result": None, "block_hash": "AB",
+             "previous": 3},
+            {"to": SELLER, "amount_raw": PRICE, "result": None, "block_hash": "AB",
+             "previous": "CD", "block": "x"},
+        ]
+        for shape in shapes:
+            content = json.dumps({key: shape})
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (shape, out))
+            self.assertEqual(len(self.node.published), before, shape)
+            self.assertIn(ledger, out["message"], shape)
+            self.assertIn("do NOT delete it", out["message"], shape)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content, shape)
+
 
 def _hash(block):
     return fakenode._hash_of(block)

@@ -64,9 +64,9 @@ MAX_BODY = 1 << 20
 
 
 class Refused(Exception):
-    def __init__(self, reason, message):
+    def __init__(self, reason, message, extra=None):
         super().__init__(message)
-        self.reason, self.message = reason, message
+        self.reason, self.message, self.extra = reason, message, dict(extra or {})
 
 
 # ------------------------------------------------------------------ fetch
@@ -354,10 +354,22 @@ def _ledger_load(path):
     return _strict_load(path, "ledger")
 
 
+def _ledger_directory(path):
+    """The directory the save writes into, read from the path exactly as given (never
+    normalised: abspath would resolve 'missing/..' textually where the OS does not)."""
+    return os.path.dirname(path) or os.curdir
+
+
 def _ledger_directory_check(path):
     """Refuse before signing when the sent ledger could not be saved: a payment published and
-    then not recorded could make a retry sign a NEW block and pay twice."""
-    directory = os.path.dirname(os.path.abspath(path))
+    then not recorded could make a retry sign a NEW block and pay twice. The check, the load and
+    the save all use this one path as given."""
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)):
+        raise Refused("ledger-unwritable", "sent ledger %s ends in a path separator, so it names "
+                      "a directory, not a file, and a payment could not be recorded; give the "
+                      "ledger's file path; do NOT start a new empty ledger elsewhere if payments "
+                      "were already recorded: not paying" % path)
+    directory = _ledger_directory(path)
     if not os.path.isdir(directory):
         raise Refused("ledger-unwritable", "the directory %s for sent ledger %s does not exist "
                       "(or is not a directory), so a payment could not be recorded; create it "
@@ -391,7 +403,7 @@ def _file_lock(path):
 def _ledger_save(path, sent):
     """Atomic replace through a unique temp file in the same directory (mkstemp: O_EXCL, 0600,
     so a planted symlink at a predictable name is never followed)."""
-    directory = os.path.dirname(os.path.abspath(path))
+    directory = _ledger_directory(path)
     fd, temp = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -403,6 +415,63 @@ def _ledger_save(path, sent):
         with contextlib.suppress(OSError):
             os.unlink(temp)
         raise
+
+
+_ENTRY_ADVICE = ("restore it from a backup or fix it by hand; do NOT delete it - it records "
+                 "blocks already sent")
+
+
+def _ledger_entry_check(path, key, record):
+    """The entry already held under this payment's key, if any, must have the shape
+    payments.send writes; a wrong one is refused before signing instead of crashing in it."""
+    if record is None:
+        return
+    problems = []
+    if not (isinstance(record.get("to"), str) and record["to"]):
+        problems.append("'to' is not an address string")
+    amount = record.get("amount_raw")
+    if not (isinstance(amount, int) and not isinstance(amount, bool) and amount > 0):
+        problems.append("'amount_raw' is not a positive integer")
+    result = record.get("result")
+    if result is not None and not (isinstance(result, dict)
+                                   and isinstance(result.get("block_hash"), str)
+                                   and result["block_hash"]):
+        problems.append("'result' is neither null nor an object with a 'block_hash' string")
+    for name, kind, label in (("block_hash", str, "a string"), ("previous", str, "a string"),
+                              ("block", dict, "an object")):
+        if record.get(name) is not None and not isinstance(record[name], kind):
+            problems.append("%r is not %s" % (name, label))
+    if problems:
+        raise Refused("ledger-malformed", "sent ledger %s: the entry for this payment (%r) is not "
+                      "one pay402 wrote (%s): %s: not paying"
+                      % (path, key, "; ".join(problems), _ENTRY_ADVICE))
+
+
+def _ledger_save_after_send(path, sent, key, block_hash, tool_error=None):
+    """Save the ledger once payments.send has run. A save that fails here may leave a published
+    payment unrecorded, so say so plainly, with the record to add by hand: a retry could pay
+    twice."""
+    try:
+        _ledger_save(path, sent)
+    except OSError as exc:
+        record = sent.get(key)
+        if tool_error is not None and record is None:
+            raise Refused(tool_error.reason, "%s (and the sent ledger %s could not be saved: %s)"
+                          % (tool_error.message, path, exc)) from None
+        block_hash = block_hash or (record or {}).get("block_hash")
+        unsaved = {key: record}
+        if tool_error is None:
+            state = "the payment WAS published as block %s" % block_hash
+        else:
+            state = ("the payment MAY have been published as block %s (%s: %s)"
+                     % (block_hash, tool_error.reason, tool_error.message))
+        raise Refused("ledger-unsaved", "%s, but the sent ledger %s could not be saved (%s). "
+                      "do NOT retry: a retry could pay twice; add this record to the ledger by "
+                      "hand (merge the unsaved_record object into %s as one more key), then "
+                      "check the block on a block explorer: %s"
+                      % (state, path, exc, path, json.dumps(unsaved, sort_keys=True)),
+                      {"block_hash": block_hash, "unsaved_record": unsaved,
+                       "ledger": path}) from None
 
 
 def idempotency_key(url, pay_to, raw):
@@ -434,14 +503,15 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
     sent = _ledger_load(ledger)
     env = {"NANO_WALLET_ALLOW_SEND": "1", "NANO_WALLET_MAX_SEND_XNO": max_xno}
     key = idempotency_key(url, summary["pay_to"], int(summary["amount_raw"]))
+    _ledger_entry_check(ledger, key, sent.get(key))
     try:
         result = payments.send(source, summary["pay_to"], summary["amount_xno"], key, node, keys,
                                sent, env=env)
     except payments.ToolError as exc:
-        _ledger_save(ledger, sent)
+        _ledger_save_after_send(ledger, sent, key, None, exc)
         raise Refused(exc.reason, exc.message) from None
-    _ledger_save(ledger, sent)
     block_hash = result["block_hash"]
+    _ledger_save_after_send(ledger, sent, key, block_hash)
     confirmed = wait_confirmed(node, block_hash, confirm_seconds, sleep)
     header = payment_header(block_hash, entry, keys.get(source))
     status, _, body = fetcher(url, method=method, data=data,
@@ -519,7 +589,7 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
         out(result)
         return 0 if 200 <= result["seller_status"] < 300 else 3
     except Refused as exc:
-        out({"paid": False, "refused": exc.reason, "message": exc.message})
+        out(dict(exc.extra, paid=False, refused=exc.reason, message=exc.message))
         return 2 if exc.reason == "usage" else 1
 
 
