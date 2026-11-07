@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -215,6 +216,604 @@ class Paying(Funded):
         code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "100"],
                         Seller(challenge(e)), self.node)
         self.assertEqual((code, out["refused"]), (1, "insufficient_balance"))
+
+
+OTHER_SELLER = nanoaddr.encode(ed.public_key_from_private(bytes.fromhex("44" * 32)))
+
+
+class PinPayTo(Funded):
+    """--pin-file: a seller's origin keeps the payTo it named on first read."""
+
+    def setUp(self):
+        super().setUp()
+        self.pins = os.path.join(self.tmp.name, "pins.json")
+
+    def read(self, pay_to, url=URL, pins=True):
+        return run([url, "--max-xno", "0.1"] + (["--pin-file", self.pins] if pins else []),
+                   Seller(challenge(entry(payTo=pay_to))))
+
+    def test_first_read_pins_the_pay_to(self):
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["pin"]["origin"], out["pin"]["pay_to"], out["pin"]["pinned_now"]),
+                         ("https://seller.example:443", SELLER, True))
+        with open(self.pins) as handle:
+            stored = json.load(handle)
+        self.assertEqual(stored["https://seller.example:443"]["pay_to"], SELLER)
+        self.assertIn("first_seen", stored["https://seller.example:443"])
+        self.assertEqual(stat.S_IMODE(os.stat(self.pins).st_mode), 0o600)
+
+    def test_same_pay_to_passes(self):
+        self.read(SELLER)
+        code, out = self.read(SELLER, url="https://SELLER.example:443/api/other")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["pin"]["pinned_now"])
+
+    def test_changed_pay_to_is_refused(self):
+        self.read(SELLER)
+        code, out = self.read(OTHER_SELLER, url="https://seller.example/api/other")
+        self.assertEqual((code, out["refused"]), (1, "payto-changed"), out)
+        self.assertIn(SELLER, out["message"])
+        self.assertIn(OTHER_SELLER, out["message"])
+        with open(self.pins) as handle:
+            self.assertEqual(json.load(handle)["https://seller.example:443"]["pay_to"], SELLER,
+                             "a refused read does not move the pin")
+
+    def test_changed_pay_to_is_refused_before_paying(self):
+        self.read(SELLER)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--pin-file", self.pins], Seller(challenge(entry(payTo=OTHER_SELLER))), self.node)
+        self.assertEqual((code, out["refused"]), (1, "payto-changed"), out)
+        self.assertEqual([b for b in self.node.published
+                          if b["link"] == nanoaddr.decode(OTHER_SELLER).hex().upper()], [])
+
+    def test_without_pin_file_nothing_is_compared(self):
+        self.read(SELLER)
+        code, out = self.read(OTHER_SELLER, pins=False)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("pin", out)
+
+    def test_the_pin_is_per_origin(self):
+        self.read(SELLER)
+        for other in ("https://other.example/api/audit", "http://seller.example/api/audit",
+                      "https://seller.example:8443/api/audit"):
+            code, out = self.read(OTHER_SELLER, url=other)
+            self.assertEqual(code, 0, (other, out))
+            self.assertTrue(out["pin"]["pinned_now"], other)
+        code, out = self.read(OTHER_SELLER)
+        self.assertEqual(out["refused"], "payto-changed")
+
+
+    # -- fail closed on a damaged pin file, never rewrite it -----------------------------
+
+    def _refused_untouched(self, content, reason):
+        with open(self.pins, "w") as handle:
+            handle.write(content)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, reason), out)
+        with open(self.pins) as handle:
+            self.assertEqual(handle.read(), content, "a refused pin file is not rewritten")
+
+    def test_corrupt_pin_file_is_refused(self):
+        self._refused_untouched("{not json", "pin-file-malformed")
+
+    def test_truncated_pin_file_is_refused(self):
+        full = json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER, "first_seen": "x"}})
+        self._refused_untouched(full[: len(full) // 2], "pin-file-malformed")
+
+    def test_list_top_level_is_refused(self):
+        self._refused_untouched(json.dumps([{"pay_to": SELLER}]), "pin-file-malformed")
+
+    def test_empty_pay_to_entry_is_refused(self):
+        self._refused_untouched(json.dumps({"https://seller.example:443": {"pay_to": ""}}),
+                                "pin-entry-malformed")
+
+    def test_bare_string_entry_is_refused(self):
+        self._refused_untouched(json.dumps({"https://seller.example:443": OTHER_SELLER}),
+                                "pin-entry-malformed")
+
+    def test_malformed_entry_of_another_origin_is_refused(self):
+        self._refused_untouched(json.dumps({"https://other.example:443": 7}), "pin-entry-malformed")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads any file")
+    def test_unreadable_pin_file_is_refused(self):
+        with open(self.pins, "w") as handle:
+            json.dump({"https://other.example:443": {"pay_to": OTHER_SELLER}}, handle)
+        os.chmod(self.pins, 0)
+        self.addCleanup(os.chmod, self.pins, 0o600)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        os.chmod(self.pins, 0o600)
+        with open(self.pins) as handle:
+            self.assertIn("https://other.example:443", json.load(handle))
+
+    def test_permission_error_on_pin_file_is_refused(self):
+        # The chmod test above is skipped as root; this one injects the same OSError.
+        from unittest import mock
+        content = json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER}})
+        with open(self.pins, "w") as handle:
+            handle.write(content)
+        real_open = os.open
+
+        def denying_open(path, *a, **kw):
+            if path == self.pins:
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *a, **kw)
+
+        with mock.patch.object(pay402.os, "open", denying_open):
+            code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        with open(self.pins) as handle:
+            self.assertEqual(handle.read(), content)
+
+    def test_directory_at_pin_path_is_refused_cleanly(self):
+        os.mkdir(self.pins)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        self.assertTrue(os.path.isdir(self.pins))
+
+    def test_zero_byte_pin_file_says_empty_and_names_the_path(self):
+        open(self.pins, "w").close()
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-malformed"), out)
+        self.assertIn("empty", out["message"])
+        self.assertIn("remove it", out["message"])
+        self.assertIn(self.pins, out["message"])
+        self.assertTrue(os.path.exists(self.pins), "an empty pin file is not auto-deleted")
+        self.assertEqual(os.path.getsize(self.pins), 0)
+
+    def test_pin_file_in_missing_directory_is_refused_and_leaves_nothing(self):
+        missing = os.path.join(self.tmp.name, "no-such-dir")
+        self.pins = os.path.join(missing, "pins.json")
+        before = sorted(os.listdir(self.tmp.name))
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.tmp.name)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unwritable"), out)
+        self.assertIn("does not exist", out["message"])
+        self.assertIn(missing, out["message"])
+        self.assertFalse(os.path.exists(missing), "the directory is not created")
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), before, "no stray .lock or temp file")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_fifo_at_pin_path_is_refused_without_hanging(self):
+        os.mkfifo(self.pins)
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(zip(("code", "out"), self.read(SELLER))),
+                                  daemon=True)
+        worker.start()
+        worker.join(10)
+        if worker.is_alive():
+            # Unblock the hung reader so the test process can finish, then fail.
+            with open(self.pins, "w"):
+                pass
+            worker.join(5)
+            self.fail("a FIFO pin file blocked the read while holding FILE.lock")
+        self.assertEqual((result["code"], result["out"].get("refused")), (1, "pin-file-unreadable"),
+                         result)
+        self.assertIn("not a regular file", result["out"]["message"])
+        # The lock was released: a second check on another path through the same lock works.
+        with pay402._file_lock(self.pins):
+            pass
+
+    def test_nul_in_pin_path_is_a_clean_refusal(self):
+        with self.assertRaises(pay402.Refused) as caught:
+            pay402.check_pin(self.pins + "\0x", URL, SELLER)
+        self.assertEqual(caught.exception.reason, "pin-file-unreadable")
+
+    def test_docs_do_not_blame_an_older_version_for_empty_pin_files(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("pay402.py", "README.md"):
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                text = " ".join(handle.read().split())
+            self.assertNotIn("older version could leave", text, name)
+            self.assertIn("empty pin file (e.g. after a crash) holds no pins", text, name)
+
+    def test_bad_port_is_refused_cleanly(self):
+        for url in ("https://seller.example:99999/api/audit", "https://seller.example:abc/api/audit"):
+            code, out = self.read(SELLER, url=url)
+            self.assertEqual((code, out.get("refused")), (2, "usage"), (url, out))
+        self.assertFalse(os.path.exists(self.pins))
+
+    def test_trailing_dot_host_is_the_same_origin(self):
+        self.read(SELLER)
+        code, out = self.read(OTHER_SELLER, url="https://seller.example./api/audit")
+        self.assertEqual((code, out.get("refused")), (1, "payto-changed"), out)
+
+    def test_concurrent_first_reads_keep_every_pin(self):
+        origins = ["https://s%d.example" % i for i in range(24)]
+        errors = []
+
+        def one(origin):
+            try:
+                pay402.check_pin(self.pins, origin + "/x", SELLER)
+            except Exception as exc:                         # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=one, args=(o,)) for o in origins]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        with open(self.pins) as handle:
+            stored = json.load(handle)
+        self.assertEqual(sorted(stored), sorted(o + ":443" for o in origins))
+        leftovers = [n for n in os.listdir(self.tmp.name) if n.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_empty_pin_file_value_is_a_usage_error(self):
+        for value in ("", "   "):
+            seller = Seller(challenge(entry()))
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                             "--pin-file", value], seller, self.node)
+            self.assertEqual((code, out.get("refused")), (2, "usage"), (value, out))
+            self.assertIn("--pin-file", out["message"])
+            self.assertEqual(seller.requests, [], "refused before the seller is even read")
+        self.assertEqual(self.sends(), [])
+
+    def test_entry_without_first_seen_is_refused(self):
+        self._refused_untouched(json.dumps({"https://seller.example:443": {"pay_to": SELLER}}),
+                                "pin-entry-malformed")
+
+    def test_entry_of_another_origin_without_first_seen_is_refused(self):
+        self._refused_untouched(json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER}}),
+                                "pin-entry-malformed")
+
+    def test_files_this_code_writes_still_load(self):
+        self.read(SELLER)
+        self.read(SELLER, url="https://other.example/x")
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["pin"]["pinned_now"])
+
+    def test_duplicate_origin_key_is_refused(self):
+        content = ('{"https://seller.example:443": {"pay_to": "%s", "first_seen": "a"}, '
+                   '"https://seller.example:443": {"pay_to": "%s", "first_seen": "b"}}'
+                   % (OTHER_SELLER, SELLER))
+        self._refused_untouched(content, "pin-file-malformed")
+
+    def test_duplicate_inner_key_is_refused(self):
+        content = ('{"https://seller.example:443": {"pay_to": "%s", "pay_to": "%s", '
+                   '"first_seen": "a"}}' % (OTHER_SELLER, SELLER))
+        self._refused_untouched(content, "pin-file-malformed")
+
+    def test_dangling_symlink_at_pin_path_is_refused(self):
+        os.symlink(os.path.join(self.tmp.name, "missing.json"), self.pins)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        self.assertTrue(os.path.islink(self.pins))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "missing.json")))
+
+    def test_live_symlink_at_pin_path_is_refused_and_kept(self):
+        real = os.path.join(self.tmp.name, "real.json")
+        content = json.dumps({"https://other.example:443": {"pay_to": OTHER_SELLER, "first_seen": "x"}})
+        with open(real, "w") as handle:
+            handle.write(content)
+        os.symlink(real, self.pins)
+        code, out = self.read(SELLER)
+        self.assertEqual((code, out.get("refused")), (1, "pin-file-unreadable"), out)
+        self.assertTrue(os.path.islink(self.pins), "the link is not replaced by a plain file")
+        with open(real) as handle:
+            self.assertEqual(handle.read(), content)
+
+    def test_missing_plain_pin_path_is_first_use(self):
+        self.assertFalse(os.path.lexists(self.pins))
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out["pin"]["pinned_now"])
+
+    def test_save_does_not_follow_a_planted_tmp_symlink(self):
+        target = os.path.join(self.tmp.name, "victim")
+        with open(target, "w") as handle:
+            handle.write("keep")
+        os.symlink(target, self.pins + ".tmp")
+        code, out = self.read(SELLER)
+        self.assertEqual(code, 0, out)
+        with open(target) as handle:
+            self.assertEqual(handle.read(), "keep")
+
+    def _pay_refused(self, reason):
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--pin-file", self.pins], Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, reason), out)
+        self.assertEqual(len(self.node.published), before, "nothing is paid")
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
+    def test_symlink_swapped_in_after_the_islink_check_is_refused(self):
+        real = os.path.join(self.tmp.name, "real.json")
+        content = json.dumps({"https://seller.example:443": {"pay_to": SELLER, "first_seen": "x"}})
+        with open(real, "w") as handle:
+            handle.write(content)
+        os.symlink(real, self.pins)
+        # islink() said "plain file", then the path became a link: the open must not follow it.
+        with mock.patch.object(pay402.os.path, "islink", return_value=False):
+            self._pay_refused("pin-file-unreadable")
+        self.assertTrue(os.path.islink(self.pins))
+        with open(real) as handle:
+            self.assertEqual(handle.read(), content)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW") and pay402.fcntl is not None, "needs O_NOFOLLOW and fcntl")
+    def test_symlink_at_lock_path_is_refused(self):
+        target = os.path.join(self.tmp.name, "victim")
+        os.symlink(target, self.pins + ".lock")
+        self._pay_refused("pin-file-unwritable")
+        self.assertFalse(os.path.lexists(target), "the lock open does not follow the link")
+        self.assertFalse(os.path.lexists(self.pins))
+
+    def test_deeply_nested_pin_file_is_refused(self):
+        self._refused_untouched("[" * 100000, "pin-file-malformed")
+        self._pay_refused("pin-file-malformed")
+
+
+
+class SentLedgerFailsClosed(Funded):
+    def test_corrupt_sent_ledger_is_refused_before_signing(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        with open(ledger, "w") as handle:
+            handle.write("{trunc")
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), out)
+        self.assertEqual(len(self.node.published), before)
+        with open(ledger) as handle:
+            self.assertEqual(handle.read(), "{trunc")
+
+    def test_corrupt_sent_ledger_message_never_says_remove(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ("{trunc", "[]", ""):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (content, out))
+            message = out["message"]
+            self.assertIn("do NOT delete it", message, content)
+            self.assertIn("backup", message, content)
+            self.assertNotIn("remove", message, content)
+            self.assertNotIn("rm ", message, content)
+            if not content:
+                self.assertIn("empty", message)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content)
+
+    def test_empty_sent_ledger_message_names_the_brace_recovery(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ("", "  \n\t"):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (content, out))
+            self.assertEqual(len(self.node.published), before)
+            message = out["message"]
+            self.assertIn("write {} into it", message, content)
+            self.assertIn("sure no payment was recorded", message, content)
+            self.assertIn(ledger, message, content)
+            self.assertIn("do NOT delete it", message, content)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content, "the ledger is never rewritten for you")
+
+    def test_non_empty_corrupt_sent_ledger_does_not_suggest_braces(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ("{trunc", "[]"):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual(out.get("refused"), "ledger-malformed", out)
+            self.assertNotIn("{}", out["message"], content)
+            self.assertIn("do NOT delete it", out["message"], content)
+
+    def test_readme_flags_the_sent_ledger_behaviour_change(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "README.md"), encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("### Upgrading: a damaged sent ledger now stops --pay", text)
+        self.assertIn("even without `--pin-file`", text)
+        self.assertIn("write `{}` into it", text)
+
+    def test_duplicate_key_in_sent_ledger_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        content = '{"k": "a", "k": "b"}'
+        with open(ledger, "w") as handle:
+            handle.write(content)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), out)
+        self.assertEqual(len(self.node.published), before)
+
+    def test_deeply_nested_sent_ledger_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        content = "[" * 100000
+        with open(ledger, "w") as handle:
+            handle.write(content)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), out)
+        self.assertEqual(len(self.node.published), before)
+        with open(ledger) as handle:
+            self.assertEqual(handle.read(), content)
+
+    def test_sent_ledger_entry_that_is_not_an_object_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        for content in ('{"a": 1}', '{"a": []}', '{"a": "x"}', '{"a": null}'):
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (content, out))
+            self.assertEqual(len(self.node.published), before, content)
+            self.assertIn(ledger, out["message"], content)
+            self.assertIn("do NOT delete it", out["message"], content)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
+    def test_dangling_symlink_sent_ledger_is_refused_before_signing(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        target = os.path.join(os.path.dirname(ledger), "gone.json")
+        os.symlink(target, ledger)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unreadable"), out)
+        self.assertEqual(len(self.node.published), before, "nothing is signed or published")
+        self.assertIn(ledger, out["message"])
+        self.assertIn("dangling", out["message"])
+        self.assertTrue(os.path.islink(ledger), "the link is left as it was")
+        self.assertFalse(os.path.lexists(target))
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
+    def test_symlink_to_a_valid_sent_ledger_is_still_read(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        real = os.path.join(os.path.dirname(ledger), "real-ledger.json")
+        with open(real, "w") as handle:
+            handle.write("{}")
+        os.symlink(real, ledger)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+        self.assertEqual(len(self.node.published), before + 1)
+
+    def test_missing_sent_ledger_on_first_use_still_pays(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        self.assertFalse(os.path.lexists(ledger))
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+        self.assertEqual(len(self.node.published), before + 1)
+        with open(ledger) as handle:
+            self.assertEqual(len(json.load(handle)), 1)
+
+    def test_sent_ledger_in_a_missing_directory_is_refused_before_signing(self):
+        base = os.path.dirname(self.key_file)
+        plain = os.path.join(base, "plain-file")
+        with open(plain, "w") as handle:
+            handle.write("x")
+        for ledger in (os.path.join(base, "no-such-dir", "sent.json"),
+                       os.path.join(plain, "sent.json")):
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                             "--ledger", ledger], Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), (ledger, out))
+            self.assertEqual(len(self.node.published), before, "nothing is signed or published")
+            self.assertIn(ledger, out["message"])
+            self.assertIn("do NOT", out["message"])
+        self.assertFalse(os.path.lexists(os.path.join(base, "no-such-dir")), "nothing is created")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can write anywhere")
+    def test_sent_ledger_in_a_read_only_directory_is_refused_before_signing(self):
+        locked = os.path.join(os.path.dirname(self.key_file), "locked")
+        os.mkdir(locked)
+        os.chmod(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--ledger", os.path.join(locked, "sent.json")],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), out)
+        self.assertEqual(len(self.node.published), before)
+
+    def test_missing_sent_ledger_in_an_existing_directory_still_pays(self):
+        ledger = os.path.join(os.path.dirname(self.key_file), "fresh-sent.json")
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--ledger", ledger], Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+        self.assertEqual(len(self.node.published), before + 1)
+        self.assertTrue(os.path.isfile(ledger))
+
+    def _pay_with_ledger(self, ledger):
+        return run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                    "--ledger", ledger], Seller(challenge(entry())), self.node)
+
+    def test_ledger_path_through_a_missing_directory_and_dotdot_is_refused(self):
+        base = os.path.dirname(self.key_file)
+        ledger = os.path.join(base, "missing", "..", "l.json")
+        before = len(self.node.published)
+        code, out = self._pay_with_ledger(ledger)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), out)
+        self.assertEqual(len(self.node.published), before, "nothing is signed or published")
+        self.assertIn(ledger, out["message"])
+        # A retry is refused the same way: it never pays a second time.
+        code, out = self._pay_with_ledger(ledger)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), out)
+        self.assertEqual(len(self.node.published), before)
+        self.assertFalse(os.path.lexists(os.path.join(base, "l.json")))
+
+    def test_ledger_path_ending_in_a_separator_is_refused(self):
+        base = os.path.dirname(self.key_file)
+        for ledger in (os.path.join(base, "nope") + os.sep, base + os.sep):
+            before = len(self.node.published)
+            code, out = self._pay_with_ledger(ledger)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), (ledger, out))
+            self.assertEqual(len(self.node.published), before, ledger)
+            self.assertIn(ledger, out["message"])
+        self.assertFalse(os.path.lexists(os.path.join(base, "nope")))
+
+    def test_ledger_save_failure_after_publishing_says_paid_and_prints_the_record(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        before = len(self.node.published)
+        with mock.patch.object(pay402.os, "replace", side_effect=OSError(28, "No space left on device")):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unsaved"), out)
+        self.assertEqual(len(self.node.published), before + 1, "the payment was published")
+        block_hash = _hash(self.node.published[-1])
+        self.assertEqual(out.get("block_hash"), block_hash, out)
+        self.assertIn(block_hash, out["message"])
+        self.assertIn("WAS published", out["message"])
+        self.assertIn("do NOT retry", out["message"])
+        self.assertIn(ledger, out["message"])
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        record = out["unsaved_record"]
+        self.assertEqual(list(record), [key])
+        self.assertEqual(record[key]["block_hash"], block_hash)
+        self.assertFalse(os.path.exists(ledger))
+        self.assertEqual([n for n in os.listdir(os.path.dirname(ledger)) if n.endswith(".tmp")], [])
+
+    def test_wrong_shape_entry_under_this_payments_key_is_refused(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        shapes = [
+            {},
+            {"to": SELLER},
+            {"amount_raw": PRICE},
+            {"to": SELLER, "amount_raw": str(PRICE)},
+            {"to": SELLER, "amount_raw": True, "result": None},
+            {"to": 5, "amount_raw": PRICE, "result": None},
+            {"to": SELLER, "amount_raw": PRICE, "result": "bad"},
+            {"to": SELLER, "amount_raw": PRICE, "result": {}},
+            {"to": SELLER, "amount_raw": PRICE, "result": {"block_hash": 7}},
+            {"to": SELLER, "amount_raw": PRICE, "result": None, "block_hash": 5},
+            {"to": SELLER, "amount_raw": PRICE, "result": None, "block_hash": "AB",
+             "previous": 3},
+            {"to": SELLER, "amount_raw": PRICE, "result": None, "block_hash": "AB",
+             "previous": "CD", "block": "x"},
+        ]
+        for shape in shapes:
+            content = json.dumps({key: shape})
+            with open(ledger, "w") as handle:
+                handle.write(content)
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-malformed"), (shape, out))
+            self.assertEqual(len(self.node.published), before, shape)
+            self.assertIn(ledger, out["message"], shape)
+            self.assertIn("do NOT delete it", out["message"], shape)
+            with open(ledger) as handle:
+                self.assertEqual(handle.read(), content, shape)
 
 
 def _hash(block):

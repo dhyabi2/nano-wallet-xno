@@ -111,6 +111,45 @@ re-run after a failure resubmits the SAME block instead of paying twice. If the 
 that paid. `tests/test_pay402.py` runs the whole flow against an in-memory node; a real payment was NOT
 run from this repository's tests, only the dry run is meant to be tried first.
 
+`--pin-file FILE` pins `payTo` per seller origin (scheme, host and port): the first read records the
+address and when it was first seen in that JSON file, and a later read of the same origin that names a
+different `payTo` is refused as `payto-changed` before anything is signed. Another host is not affected,
+the dry run prints the pin it compared against, and without `--pin-file` nothing is compared:
+
+```
+python3 pay402.py https://seller.example/api/audit --max-xno 0.1 --pin-file ~/.nano/payto-pins.json
+```
+
+The pin file fails closed: only a missing file means "no pins yet". A file that cannot be read, is a
+symlink (even a dangling one), is not a JSON object, repeats a key, or holds an entry without a non-empty
+`pay_to` and `first_seen` is refused (`pin-file-unreadable`, `pin-file-malformed`, `pin-entry-malformed`)
+and left untouched, so a damaged file never silently drops
+the other sellers' pins. Writes go through a unique temp file and an exclusive `flock` on `FILE.lock`
+(POSIX only), so concurrent runs do not lose each other's pins. The directory that holds `FILE` must
+already exist: it is not created, and a missing one is refused as `pin-file-unwritable` before anything
+(not even `FILE.lock`) is written. An empty pin file (e.g. after a crash) holds no pins: it
+is refused as `pin-file-malformed` with a message that says it is empty and names the path; it is never
+deleted for you, so remove it yourself if you have no pins to keep. A pin file that is not a regular file
+(a FIFO, a device) is refused as `pin-file-unreadable` instead of blocking. An empty `--pin-file ""` is a usage error, never "pinning off". One trailing dot on the host is the same
+origin; IDN hosts are not normalised (a Unicode host and its `xn--` form are two origins). The same
+fail-closed read now applies to the sent ledger (`ledger-unreadable` / `ledger-malformed`): reading a
+corrupt ledger as empty could pay twice. Unlike the pin file, a damaged or empty sent ledger must NOT be
+deleted: it records blocks already sent, so restore it from a backup or fix it by hand. These are tested against the in-memory fake node only.
+
+### Upgrading: a damaged sent ledger now stops --pay
+
+This is a behaviour change for everyone who runs `pay402.py --pay`, even without `--pin-file`. The sent
+ledger (`KEY_FILE.pay402-sent.json` unless you move it) used to be read as empty when it was 0 bytes,
+only whitespace, not JSON or not a JSON object, and the payment went ahead. It is now refused
+(`ledger-malformed` or `ledger-unreadable`, exit 1) before anything is signed. Why: the ledger is how a
+retry knows a block was already sent, so a lost or blanked ledger read as "nothing sent" can mean paying
+the same seller twice. A missing ledger is still fine (it means nothing has been sent yet), but a dangling symlink at the ledger path is not missing: it is refused as `ledger-unreadable` naming the path, so point the link at the real ledger or restore it. A ledger entry that is not a JSON object (e.g. `{"a": 1}`) is refused as `ledger-malformed`. A symlink to an existing ledger file is read as before. If the folder that should hold the ledger does not exist or is not writable, `--pay` is refused as `ledger-unwritable` (exit 1, naming the path) before anything is signed, because a payment that cannot be recorded could be paid again on a retry; so is a `--ledger` path ending in `/`, and the folder is checked as you typed it (`dir/missing/../sent.json` is refused when `missing` does not exist). If saving the ledger still fails after a payment was published, pay402 exits 1 with `ledger-unsaved`, the block hash and the unsaved record as JSON (`unsaved_record`): do NOT retry, add that record to the ledger by hand. An entry for this same payment that is not shaped the way pay402 writes it is refused as `ledger-malformed`. To recover:
+
+- Empty file (0 bytes or only whitespace): if you are sure no payment was recorded in it,
+  write `{}` into it (`printf '{}' > ~/.nano/key.json.pay402-sent.json`, with your own path) and run again. If you are not
+  sure, restore it from a backup.
+- Any other damage: restore it from a backup or fix the JSON by hand. Do NOT delete it.
+
 ## Why this exists
 
 The swarm wrote to 501 outside agents, 139 answered, 1 transacted. The nearest
