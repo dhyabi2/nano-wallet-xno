@@ -695,6 +695,44 @@ class SentLedgerFailsClosed(Funded):
         with open(ledger) as handle:
             self.assertEqual(len(json.load(handle)), 1)
 
+    def test_sent_ledger_in_a_missing_directory_is_refused_before_signing(self):
+        base = os.path.dirname(self.key_file)
+        plain = os.path.join(base, "plain-file")
+        with open(plain, "w") as handle:
+            handle.write("x")
+        for ledger in (os.path.join(base, "no-such-dir", "sent.json"),
+                       os.path.join(plain, "sent.json")):
+            before = len(self.node.published)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                             "--ledger", ledger], Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), (ledger, out))
+            self.assertEqual(len(self.node.published), before, "nothing is signed or published")
+            self.assertIn(ledger, out["message"])
+            self.assertIn("do NOT", out["message"])
+        self.assertFalse(os.path.lexists(os.path.join(base, "no-such-dir")), "nothing is created")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can write anywhere")
+    def test_sent_ledger_in_a_read_only_directory_is_refused_before_signing(self):
+        locked = os.path.join(os.path.dirname(self.key_file), "locked")
+        os.mkdir(locked)
+        os.chmod(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--ledger", os.path.join(locked, "sent.json")],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("refused")), (1, "ledger-unwritable"), out)
+        self.assertEqual(len(self.node.published), before)
+
+    def test_missing_sent_ledger_in_an_existing_directory_still_pays(self):
+        ledger = os.path.join(os.path.dirname(self.key_file), "fresh-sent.json")
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1",
+                         "--ledger", ledger], Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+        self.assertEqual(len(self.node.published), before + 1)
+        self.assertTrue(os.path.isfile(ledger))
+
 
 def _hash(block):
     return fakenode._hash_of(block)

@@ -354,6 +354,23 @@ def _ledger_load(path):
     return _strict_load(path, "ledger")
 
 
+def _ledger_directory_check(path):
+    """Refuse before signing when the sent ledger could not be saved: a payment published and
+    then not recorded could make a retry sign a NEW block and pay twice."""
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory):
+        raise Refused("ledger-unwritable", "the directory %s for sent ledger %s does not exist "
+                      "(or is not a directory), so a payment could not be recorded; create it "
+                      "first, or if the ledger was moved point --ledger at it; do NOT start a new "
+                      "empty ledger elsewhere if payments were already recorded (nothing was "
+                      "created): not paying" % (directory, path))
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise Refused("ledger-unwritable", "the directory %s for sent ledger %s is not writable, "
+                      "so a payment could not be recorded; fix its permissions; do NOT start a "
+                      "new empty ledger elsewhere if payments were already recorded: not paying"
+                      % (directory, path))
+
+
 @contextlib.contextmanager
 def _file_lock(path):
     """Exclusive flock on path + '.lock' (POSIX). Without fcntl it is a no-op."""
@@ -413,6 +430,7 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
     except _keystore.KeyStoreError as exc:
         raise Refused(exc.reason, exc.message) from None
     ledger = ledger or os.path.expanduser(key_file) + ".pay402-sent.json"
+    _ledger_directory_check(ledger)
     sent = _ledger_load(ledger)
     env = {"NANO_WALLET_ALLOW_SEND": "1", "NANO_WALLET_MAX_SEND_XNO": max_xno}
     key = idempotency_key(url, summary["pay_to"], int(summary["amount_raw"]))
