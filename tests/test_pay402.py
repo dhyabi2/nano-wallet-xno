@@ -767,7 +767,9 @@ class SentLedgerFailsClosed(Funded):
         with mock.patch.object(pay402.os, "replace", side_effect=OSError(28, "No space left on device")):
             code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
                             Seller(challenge(entry())), self.node)
-        self.assertEqual((code, out.get("refused")), (1, "ledger-unsaved"), out)
+        self.assertEqual((code, out.get("paid"), out.get("recorded"), out.get("error")),
+                         (4, True, False, "ledger-unsaved"), out)
+        self.assertNotIn("refused", out)
         self.assertEqual(len(self.node.published), before + 1, "the payment was published")
         block_hash = _hash(self.node.published[-1])
         self.assertEqual(out.get("block_hash"), block_hash, out)
@@ -781,6 +783,62 @@ class SentLedgerFailsClosed(Funded):
         self.assertEqual(record[key]["block_hash"], block_hash)
         self.assertFalse(os.path.exists(ledger))
         self.assertEqual([n for n in os.listdir(os.path.dirname(ledger)) if n.endswith(".tmp")], [])
+
+    def _publish_then_raise(self, error):
+        real = self.node.process
+
+        def process(block):
+            real(block)
+            raise error
+        return mock.patch.object(self.node, "process", side_effect=process)
+
+    def test_lost_reply_and_ledger_save_failure_says_paid_unknown_exit_4(self):
+        before = len(self.node.published)
+        with self._publish_then_raise(fakenode.nanonode.NodeError("timeout", "no reply")), \
+                mock.patch.object(pay402.os, "replace", side_effect=OSError(28, "No space")):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("error")), (4, "unknown", "ledger-unsaved"), out)
+        self.assertEqual(len(self.node.published), before + 1)
+        block_hash = _hash(self.node.published[-1])
+        self.assertEqual(out.get("block_hash"), block_hash, out)
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        self.assertEqual(out["unsaved_record"][key]["block_hash"], block_hash)
+        self.assertIn("MAY have been published", out["message"])
+
+    def test_unexpected_error_after_publishing_saves_the_record_and_reraises(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        before = len(self.node.published)
+        with self._publish_then_raise(RuntimeError("client bug")):
+            with self.assertRaises(RuntimeError):
+                run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                    Seller(challenge(entry())), self.node)
+        self.assertEqual(len(self.node.published), before + 1)
+        block_hash = _hash(self.node.published[-1])
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        with open(ledger) as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved[key]["block_hash"], block_hash, "the attempt is on disk")
+        # A retry settles the same block: it never publishes a second payment.
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual(len(self.node.published) - before, 1, out)
+
+    def test_unexpected_error_and_ledger_save_failure_says_paid_unknown_exit_4(self):
+        with self._publish_then_raise(RuntimeError("client bug")), \
+                mock.patch.object(pay402.os, "replace", side_effect=OSError(28, "No space")):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("error")), (4, "unknown", "ledger-unsaved"), out)
+        self.assertIn("RuntimeError: client bug", out["message"])
+
+    def test_unexpected_error_before_signing_is_raised_and_writes_nothing(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        with mock.patch.object(self.node, "account_info", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                    Seller(challenge(entry())), self.node)
+        self.assertFalse(os.path.exists(ledger))
 
     def test_wrong_shape_entry_under_this_payments_key_is_refused(self):
         ledger = self.key_file + ".pay402-sent.json"

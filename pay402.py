@@ -29,7 +29,13 @@ What it does, in order, and stops at the first thing that is wrong:
 
 Safe to re-run after a failure: the send is idempotent per (url, payTo, amount) through a small
 ledger file next to the key file, so a retry resubmits the SAME block instead of paying twice.
-Exit codes: 0 ok, 1 refused before paying, 2 usage, 3 paid but the seller did not accept it.
+Exit codes: 0 ok, 1 refused before paying, 2 usage, 3 paid but the seller did not accept it,
+4 paid (or possibly paid) but the sent ledger could not be saved (`ledger-unsaved`).
+
+On exit 4 the JSON carries "paid": true when the block was published, or "paid": "unknown"
+when the node's reply never arrived so publication itself is uncertain, plus "recorded": false,
+"error": "ledger-unsaved", the block_hash, and the `unsaved_record` to add to the ledger by
+hand. Do NOT retry before adding it: a retry could pay twice. The seller is not called.
 """
 import base64
 import contextlib
@@ -67,6 +73,15 @@ class Refused(Exception):
     def __init__(self, reason, message, extra=None):
         super().__init__(message)
         self.reason, self.message, self.extra = reason, message, dict(extra or {})
+
+
+class PaidUnrecorded(Refused):
+    """A payment was (or may have been) published but the sent ledger could not be saved.
+    Not a refusal: the money moved, or may have. `paid` is True or "unknown"."""
+
+    def __init__(self, paid, message, extra=None):
+        super().__init__("ledger-unsaved", message, extra)
+        self.paid = paid
 
 
 # ------------------------------------------------------------------ fetch
@@ -455,23 +470,28 @@ def _ledger_save_after_send(path, sent, key, block_hash, tool_error=None):
         _ledger_save(path, sent)
     except OSError as exc:
         record = sent.get(key)
+        if tool_error is not None:
+            reason = getattr(tool_error, "reason", type(tool_error).__name__)
+            message = getattr(tool_error, "message", str(tool_error))
         if tool_error is not None and record is None:
-            raise Refused(tool_error.reason, "%s (and the sent ledger %s could not be saved: %s)"
-                          % (tool_error.message, path, exc)) from None
+            raise Refused(reason, "%s (and the sent ledger %s could not be saved: %s)"
+                          % (message, path, exc)) from None
         block_hash = block_hash or (record or {}).get("block_hash")
         unsaved = {key: record}
         if tool_error is None:
+            paid = True
             state = "the payment WAS published as block %s" % block_hash
         else:
+            paid = "unknown"
             state = ("the payment MAY have been published as block %s (%s: %s)"
-                     % (block_hash, tool_error.reason, tool_error.message))
-        raise Refused("ledger-unsaved", "%s, but the sent ledger %s could not be saved (%s). "
-                      "do NOT retry: a retry could pay twice; add this record to the ledger by "
-                      "hand (merge the unsaved_record object into %s as one more key), then "
-                      "check the block on a block explorer: %s"
-                      % (state, path, exc, path, json.dumps(unsaved, sort_keys=True)),
-                      {"block_hash": block_hash, "unsaved_record": unsaved,
-                       "ledger": path}) from None
+                     % (block_hash, reason, message))
+        raise PaidUnrecorded(paid, "%s, but the sent ledger %s could not be saved (%s). "
+                             "do NOT retry: a retry could pay twice; add this record to the "
+                             "ledger by hand (merge the unsaved_record object into %s as one "
+                             "more key), then check the block on a block explorer: %s"
+                             % (state, path, exc, path, json.dumps(unsaved, sort_keys=True)),
+                             {"block_hash": block_hash, "unsaved_record": unsaved,
+                              "ledger": path}) from tool_error
 
 
 def idempotency_key(url, pay_to, raw):
@@ -510,6 +530,14 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
     except payments.ToolError as exc:
         _ledger_save_after_send(ledger, sent, key, None, exc)
         raise Refused(exc.reason, exc.message) from None
+    except Exception as exc:
+        # Any other error (a bug, a node client raising something unexpected) may come after
+        # the block was handed to the node: payments.send records the attempt before the
+        # broadcast. Save that record so a retry settles it instead of paying again, then
+        # let the error through unchanged.
+        if sent.get(key) is not None:
+            _ledger_save_after_send(ledger, sent, key, None, exc)
+        raise
     block_hash = result["block_hash"]
     _ledger_save_after_send(ledger, sent, key, block_hash)
     confirmed = wait_confirmed(node, block_hash, confirm_seconds, sleep)
@@ -588,6 +616,9 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
             result["pin"] = summary["pin"]
         out(result)
         return 0 if 200 <= result["seller_status"] < 300 else 3
+    except PaidUnrecorded as exc:
+        out(dict(exc.extra, paid=exc.paid, recorded=False, error=exc.reason, message=exc.message))
+        return 4
     except Refused as exc:
         out(dict(exc.extra, paid=False, refused=exc.reason, message=exc.message))
         return 2 if exc.reason == "usage" else 1
