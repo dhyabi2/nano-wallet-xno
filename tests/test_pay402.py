@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -806,13 +807,15 @@ class SentLedgerFailsClosed(Funded):
         self.assertEqual(out["unsaved_record"][key]["block_hash"], block_hash)
         self.assertIn("MAY have been published", out["message"])
 
-    def test_unexpected_error_after_publishing_saves_the_record_and_reraises(self):
+    def test_unexpected_error_after_publishing_saves_the_record_and_says_paid_unknown(self):
         ledger = self.key_file + ".pay402-sent.json"
         before = len(self.node.published)
         with self._publish_then_raise(RuntimeError("client bug")):
-            with self.assertRaises(RuntimeError):
-                run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
-                    Seller(challenge(entry())), self.node)
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("recorded"), out.get("error")),
+                         (5, "unknown", True, "RuntimeError"), out)
+        self.assertIn("RuntimeError: client bug", out["message"])
         self.assertEqual(len(self.node.published), before + 1)
         block_hash = _hash(self.node.published[-1])
         key = pay402.idempotency_key(URL, SELLER, PRICE)
@@ -912,6 +915,89 @@ class SentLedgerFailsClosed(Funded):
         self.assertIn("If that save fails as well, the error is NOT raised: pay402 exits 4", readme)
         self.assertIn("deliberately not a subclass of `pay402.Refused`", readme)
         self.assertIn("NOT\na Refused subclass", pay402.__doc__)
+
+    def _sigint_inside_fsync(self):
+        real = os.fsync
+
+        def fsync(fd):
+            os.kill(os.getpid(), signal.SIGINT)   # a real Ctrl-C arriving mid-save
+            return real(fd)
+        return mock.patch.object(pay402.os, "fsync", side_effect=fsync)
+
+    def _settles_without_a_second_payment(self, before):
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual(len(self.node.published) - before, 1, "a retry paid twice: %s" % out)
+        return code, out
+
+    def test_ctrl_c_during_the_success_save_is_held_until_the_record_is_on_disk(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        before = len(self.node.published)
+        with self._sigint_inside_fsync():
+            with self.assertRaises(KeyboardInterrupt):
+                run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                    Seller(challenge(entry())), self.node)
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        self.assertTrue(os.path.exists(ledger), "Ctrl-C mid-save left the block unrecorded")
+        with open(ledger) as handle:
+            self.assertEqual(json.load(handle)[key]["block_hash"], _hash(self.node.published[-1]))
+        self._settles_without_a_second_payment(before)
+
+    def test_second_ctrl_c_during_the_rescue_save_still_records_the_block(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        before = len(self.node.published)
+        with self._publish_then_raise(KeyboardInterrupt()), self._sigint_inside_fsync():
+            with self.assertRaises(KeyboardInterrupt):
+                run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                    Seller(challenge(entry())), self.node)
+        self.assertTrue(os.path.exists(ledger), "the second Ctrl-C left the block unrecorded")
+        self._settles_without_a_second_payment(before)
+
+    def test_keyboard_interrupt_raised_inside_the_save_reports_unrecorded_exit_4(self):
+        with mock.patch.object(pay402.os, "fsync", side_effect=KeyboardInterrupt()):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("recorded"), out.get("error")),
+                         (4, True, False, "ledger-unsaved"), out)
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        self.assertEqual(out["unsaved_record"][key]["block_hash"], _hash(self.node.published[-1]))
+
+    def test_timeout_after_handing_over_the_block_says_paid_unknown_exit_5(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        before = len(self.node.published)
+        with self._publish_then_raise(fakenode.nanonode.NodeError("timeout", "no reply")):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("recorded"), out.get("error")),
+                         (5, "unknown", True, "timeout"), out)
+        self.assertNotIn("refused", out)
+        block_hash = _hash(self.node.published[-1])
+        self.assertEqual(out.get("block_hash"), block_hash)
+        self.assertIn("retry with the same ledger is safe", out["message"])
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        with open(ledger) as handle:
+            self.assertEqual(json.load(handle)[key]["block_hash"], block_hash)
+        code, out = self._settles_without_a_second_payment(before)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+
+    def test_seller_unreachable_after_paying_is_paid_exit_3_not_refused(self):
+        def seller(url, method="GET", data=None, headers=None, timeout=20):
+            if "X-PAYMENT" in (headers or {}):
+                raise pay402.Refused("unreachable", "could not reach %s" % url)
+            return 402, {}, json.dumps(challenge(entry())).encode()
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        seller, self.node)
+        self.assertEqual((code, out.get("paid"), out.get("seller_status"), out.get("seller_error")),
+                         (3, True, None, "unreachable"), out)
+        self.assertNotIn("refused", out)
+
+    def test_readme_documents_exit_5(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = " ".join(handle.read().split())
+        self.assertIn("exits 5 with `\"paid\": \"unknown\"`, `\"recorded\": true`", readme)
+        self.assertIn("a retry with the same ledger is safe", readme)
+        self.assertIn("Ctrl-C is held until the ledger is written", readme)
 
     def test_unexpected_error_before_signing_is_raised_and_writes_nothing(self):
         ledger = self.key_file + ".pay402-sent.json"
