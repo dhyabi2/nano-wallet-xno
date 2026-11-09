@@ -46,7 +46,8 @@ the ledger is written. If that save fails as well, exit 4 with "paid":
 "unknown" is reported instead of the error. Nothing is saved, and no exit 4 is possible, when
 this run signed or settled nothing (a replay of a payment already recorded as settled, or a
 refusal before signing). Library callers: pay() raises PaidUnrecorded for exit 4; it is NOT
-a Refused subclass, so `except Refused` does not catch it.
+a Refused subclass, so `except Refused` does not catch it. It raises PaidUnknown for exit 5,
+also not a Refused subclass; a retry that still cannot settle the block exits 5 again.
 """
 import base64
 import contextlib
@@ -112,29 +113,43 @@ class PaidUnknown(Exception):
         self.paid = "unknown"
 
 
+# Refusals that leave this payment's unsettled record in the ledger yet say for certain what
+# happened: send_did_not_land (a confirmed block took the slot, nothing was paid) and
+# idempotency_conflict (the record is for other terms; nothing of this call was signed).
+_SETTLED_REFUSALS = ("send_did_not_land", "idempotency_conflict")
+
+
 class _SigintDeferred:
     """Hold Ctrl-C (SIGINT) while the sent ledger is written, then deliver it: a KeyboardInterrupt
     that lands inside the save would delete the temp file and leave a published block
     unrecorded. Main thread only (signal handlers cannot be set elsewhere); the previous
-    handler is always restored."""
+    handler is always restored. A previous handler of None (one not installed from Python) is
+    restored as signal.default_int_handler; a held Ctrl-C under SIG_DFL is re-delivered as a
+    real SIGINT once SIG_DFL is back, so it still ends the process."""
 
     def __enter__(self):
-        self.pending, self.previous = [], None
+        self.pending, self.previous, self.installed = [], None, False
         if threading.current_thread() is threading.main_thread():
             try:
                 self.previous = signal.signal(signal.SIGINT,
                                               lambda signum, frame: self.pending.append(signum))
+                self.installed = True
             except (ValueError, OSError):
                 self.previous = None
+        if self.previous is None:
+            self.previous = signal.default_int_handler
         return self
 
     def __exit__(self, *exc_info):
-        if self.previous is not None:
+        if self.installed:
             signal.signal(signal.SIGINT, self.previous)
             # Delivered only when the block ends normally: if it is already raising (e.g.
             # PaidUnrecorded) that report must reach the caller, not be replaced.
-            if self.pending and exc_info[0] is None and callable(self.previous):
-                self.previous(signal.SIGINT, None)    # the default handler raises KeyboardInterrupt
+            if self.pending and exc_info[0] is None:
+                if self.previous is signal.SIG_DFL:
+                    os.kill(os.getpid(), signal.SIGINT)   # SIG_DFL is back: ends the process
+                elif callable(self.previous):
+                    self.previous(signal.SIGINT, None)    # the default handler raises KeyboardInterrupt
         return False
 
 
@@ -597,37 +612,42 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
                            % (message, record.get("block_hash"), ledger),
                            {"block_hash": record.get("block_hash"), "ledger": ledger})
 
-    try:
-        result = payments.send(source, summary["pay_to"], summary["amount_xno"], key, node, keys,
-                               sent, env=env)
-        block_hash = result["block_hash"]
-        if sent != before:
-            # Inside the guarded region: a Ctrl-C between the send returning and this save
-            # lands in the except below, which saves the record before re-raising.
-            _ledger_save_after_send(ledger, sent, key, block_hash)
-    except PaidUnrecorded:
-        raise
-    except payments.ToolError as exc:
-        if sent != before:
-            _ledger_save_after_send(ledger, sent, key, None, exc)
-        if sent != before and (sent.get(key) or {"result": True}).get("result") is None:
-            # Raised after THIS run signed the block and handed it to the node (a timeout, a
-            # lost reply): the money may have moved.
-            raise unknown(exc.reason, exc.message) from None
-        raise Refused(exc.reason, exc.message) from None
-    except BaseException as exc:
-        # Any other error (a bug, a node client raising something unexpected, Ctrl-C /
-        # KeyboardInterrupt, SystemExit) may come after the block was handed to the node:
-        # payments.send records the attempt before the broadcast. Save that record so a
-        # retry settles it instead of paying again. Ctrl-C and SystemExit are then re-raised
-        # unchanged; any other exception becomes PaidUnknown (exit 5) so the CLI prints JSON.
-        # If that save fails too, PaidUnrecorded (exit 4, paid "unknown") is raised in its
-        # place, chained to the original error.
-        if sent != before and sent.get(key) is not None:
-            _ledger_save_after_send(ledger, sent, key, None, exc)
-            if isinstance(exc, Exception):
-                raise unknown(type(exc).__name__, "%s: %s" % (type(exc).__name__, exc)) from exc
-        raise
+    # Ctrl-C is held for the send and whichever save follows it, so one landing between the
+    # send returning (or raising) and the save starting cannot leave a signed block unsaved.
+    # A held Ctrl-C is delivered once the record is on disk (here, before the seller call).
+    with _SigintDeferred():
+        try:
+            result = payments.send(source, summary["pay_to"], summary["amount_xno"], key, node, keys,
+                                   sent, env=env)
+            block_hash = result["block_hash"]
+            if sent != before:
+                _ledger_save_after_send(ledger, sent, key, block_hash)
+        except PaidUnrecorded:
+            raise
+        except payments.ToolError as exc:
+            if sent != before:
+                _ledger_save_after_send(ledger, sent, key, None, exc)
+            if ((sent.get(key) or {"result": True}).get("result") is None
+                    and exc.reason not in _SETTLED_REFUSALS):
+                # A block for this payment was handed to the node and no reply has settled it:
+                # either THIS run just did that (a timeout, a lost reply), or an earlier run did
+                # and this retry could not settle it either (send_outcome_unknown, ledger
+                # unchanged). Either way the money may have moved: never paid false.
+                raise unknown(exc.reason, exc.message) from None
+            raise Refused(exc.reason, exc.message) from None
+        except BaseException as exc:
+            # Any other error (a bug, a node client raising something unexpected, Ctrl-C /
+            # KeyboardInterrupt, SystemExit) may come after the block was handed to the node:
+            # payments.send records the attempt before the broadcast. Save that record so a
+            # retry settles it instead of paying again. Ctrl-C and SystemExit are then re-raised
+            # unchanged; any other exception becomes PaidUnknown (exit 5) so the CLI prints JSON.
+            # If that save fails too, PaidUnrecorded (exit 4, paid "unknown") is raised in its
+            # place, chained to the original error.
+            if sent != before and sent.get(key) is not None:
+                _ledger_save_after_send(ledger, sent, key, None, exc)
+                if isinstance(exc, Exception):
+                    raise unknown(type(exc).__name__, "%s: %s" % (type(exc).__name__, exc)) from exc
+            raise
     confirmed = wait_confirmed(node, block_hash, confirm_seconds, sleep)
     header = payment_header(block_hash, entry, keys.get(source))
     paid = {"paid": True, "block_hash": block_hash, "from": source, "to": summary["pay_to"],

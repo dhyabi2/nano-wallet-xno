@@ -999,6 +999,96 @@ class SentLedgerFailsClosed(Funded):
         self.assertIn("a retry with the same ledger is safe", readme)
         self.assertIn("Ctrl-C is held until the ledger is written", readme)
 
+    def test_retry_that_still_cannot_settle_says_paid_unknown_exit_5_not_paid_false(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        argv = [URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"]
+        before = len(self.node.published)
+        with self._publish_then_raise(fakenode.nanonode.NodeError("timeout", "no reply")):
+            code, out = run(argv, Seller(challenge(entry())), self.node)
+        self.assertEqual(code, 5, out)
+        block_hash = _hash(self.node.published[-1])
+        with open(ledger) as handle:
+            content = handle.read()
+        # The retry cannot reach the node either: settling fails (send_outcome_unknown) and
+        # the ledger is unchanged. The first block may have landed: never "paid": false.
+        with mock.patch.object(self.node, "account_info",
+                               side_effect=fakenode.nanonode.NodeError("timeout", "no reply")):
+            code, out = run(argv, Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("recorded"), out.get("error")),
+                         (5, "unknown", True, "send_outcome_unknown"), out)
+        self.assertNotIn("refused", out)
+        self.assertEqual(out.get("block_hash"), block_hash, out)
+        with open(ledger) as handle:
+            self.assertEqual(handle.read(), content)
+        self.assertEqual(len(self.node.published) - before, 1)
+        with mock.patch.object(self.node, "account_info",
+                               side_effect=fakenode.nanonode.NodeError("timeout", "no reply")):
+            with self.assertRaises(pay402.PaidUnknown) as caught:
+                pay402.pay(URL, entry(), pay402.plan(URL, [entry()], "0.1")[0], self.key_file,
+                           "0.1", self.node, ledger=ledger, sleep=lambda s: None)
+        self.assertEqual(caught.exception.paid, "unknown")
+        self._settles_without_a_second_payment(before)
+
+    def test_ctrl_c_between_the_send_raising_and_the_rescue_save_still_records_the_block(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        before = len(self.node.published)
+        real = pay402._ledger_save_after_send
+
+        def save(*args, **kwargs):
+            os.kill(os.getpid(), signal.SIGINT)   # lands before the save's own guard starts
+            return real(*args, **kwargs)
+        with self._publish_then_raise(fakenode.nanonode.NodeError("timeout", "no reply")), \
+                mock.patch.object(pay402, "_ledger_save_after_send", side_effect=save):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("recorded")), (5, "unknown", True), out)
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        self.assertTrue(os.path.exists(ledger), "Ctrl-C before the rescue save left it unsaved")
+        with open(ledger) as handle:
+            self.assertEqual(json.load(handle)[key]["block_hash"], _hash(self.node.published[-1]))
+        self._settles_without_a_second_payment(before)
+
+    def test_held_ctrl_c_under_sig_dfl_is_redelivered_and_ends_the_process(self):
+        import subprocess
+        script = ("import os, signal, sys\n"
+                  "sys.path.insert(0, %r)\n"
+                  "import pay402\n"
+                  "signal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+                  "with pay402._SigintDeferred():\n"
+                  "    os.kill(os.getpid(), signal.SIGINT)\n"
+                  "    print('held', flush=True)\n"
+                  "print('continued past a held Ctrl-C', flush=True)\n" % ROOT)
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                              timeout=60)
+        self.assertEqual(proc.stdout, "held\n", proc.stderr)
+        self.assertEqual(proc.returncode, -signal.SIGINT, proc.stderr)
+
+    def test_a_none_previous_sigint_handler_is_restored_as_the_default(self):
+        real = signal.signal
+        calls = []
+
+        def fake(signum, handler):
+            previous = real(signum, handler)
+            calls.append(handler)
+            return None if len(calls) == 1 else previous   # "not installed from Python"
+        real(signal.SIGINT, signal.default_int_handler)
+        try:
+            with mock.patch.object(pay402.signal, "signal", side_effect=fake):
+                with self.assertRaises(KeyboardInterrupt):
+                    with pay402._SigintDeferred():
+                        os.kill(os.getpid(), signal.SIGINT)
+            self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+        finally:
+            real(signal.SIGINT, signal.default_int_handler)
+
+    def test_readme_names_paid_unknown_for_library_callers(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = " ".join(handle.read().split())
+        self.assertIn("For exit 5 it raises `pay402.PaidUnknown`", readme)
+        self.assertIn("exits 5 again, never 1", readme)
+        self.assertIn("It raises PaidUnknown for exit 5", " ".join(pay402.__doc__.split()))
+
     def test_unexpected_error_before_signing_is_raised_and_writes_nothing(self):
         ledger = self.key_file + ".pay402-sent.json"
         with mock.patch.object(self.node, "account_info", side_effect=RuntimeError("boom")):
