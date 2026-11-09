@@ -1086,7 +1086,9 @@ class SentLedgerFailsClosed(Funded):
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
             readme = " ".join(handle.read().split())
         self.assertIn("For exit 5 it raises `pay402.PaidUnknown`", readme)
-        self.assertIn("exits 5 again, never 1", readme)
+        self.assertIn("A retry that reaches the send and still cannot settle the block", readme)
+        self.assertNotIn("exits 5 again, never 1", readme)
+        self.assertIn("a retry that reaches the send", " ".join(pay402.__doc__.split()))
         self.assertIn("It raises PaidUnknown for exit 5", " ".join(pay402.__doc__.split()))
 
     def test_unexpected_error_before_signing_is_raised_and_writes_nothing(self):
@@ -1129,6 +1131,134 @@ class SentLedgerFailsClosed(Funded):
             self.assertIn("do NOT delete it", out["message"], shape)
             with open(ledger) as handle:
                 self.assertEqual(handle.read(), content, shape)
+
+
+class LedgerLockAndFinalRefusals(Funded):
+    """Two runs on one sent ledger never both sign; final refusals say how pay402 gets out."""
+
+    def argv(self):
+        return [URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"]
+
+    def ledger(self):
+        return self.key_file + ".pay402-sent.json"
+
+    def _pay_in_thread(self, results, name):
+        summary = pay402.plan(URL, [entry()], "0.1")[0]
+        try:
+            results[name] = pay402.pay(URL, entry(), summary, self.key_file, "0.1", self.node,
+                                       fetcher=Seller(challenge(entry())), sleep=lambda s: None)
+        except BaseException as exc:            # pragma: no cover - reported by the assertions
+            results[name] = exc
+
+    def test_second_concurrent_run_waits_for_the_first_save_and_never_pays_twice(self):
+        real_send = payments.send
+        first_sent, release = threading.Event(), threading.Event()
+        calls = []
+
+        def send(*args, **kwargs):
+            calls.append(threading.current_thread().name)
+            result = real_send(*args, **kwargs)
+            if len(calls) == 1:
+                # Run A has published its block but not yet saved the ledger.
+                first_sent.set()
+                release.wait(10)
+            return result
+        before = len(self.node.published)
+        results = {}
+        with mock.patch.object(pay402.payments, "send", side_effect=send):
+            a = threading.Thread(target=self._pay_in_thread, args=(results, "A"), name="A")
+            a.start()
+            self.assertTrue(first_sent.wait(10))
+            b = threading.Thread(target=self._pay_in_thread, args=(results, "B"), name="B")
+            b.start()
+            b.join(1.0)
+            # While A has not saved, B must not have loaded the ledger or reached the send.
+            alive, seen = b.is_alive(), list(calls)
+            release.set()
+            a.join(10)
+            b.join(10)
+        self.assertTrue(alive, "B finished while A had not saved: %r" % results.get("B"))
+        self.assertEqual(seen, ["A"])
+        self.assertIsInstance(results.get("A"), dict, results)
+        self.assertIsInstance(results.get("B"), dict, results)
+        self.assertEqual(len(self.node.published) - before, 1, "two runs on one ledger paid twice")
+        self.assertEqual(results["A"]["block_hash"], results["B"]["block_hash"], results)
+        self.assertTrue(results["B"]["replayed_send"], results)
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        with open(self.ledger()) as handle:
+            self.assertEqual(json.load(handle)[key]["result"]["block_hash"],
+                             results["A"]["block_hash"])
+
+    def test_a_run_does_not_load_the_ledger_while_its_lock_is_held(self):
+        done = threading.Event()
+        results = {}
+        before = len(self.node.published)
+
+        def worker():
+            self._pay_in_thread(results, "B")
+            done.set()
+        with pay402._file_lock(self.ledger()):
+            t = threading.Thread(target=worker)
+            t.start()
+            waited = not done.wait(1.0)
+            published_while_locked = len(self.node.published) - before
+        t.join(10)
+        self.assertTrue(waited, "a run went ahead while the ledger was locked: %r" % results)
+        self.assertEqual(published_while_locked, 0)
+        self.assertTrue(done.is_set())
+        self.assertIs(results["B"]["paid"], True, results)
+
+    def _unsettled_record(self, block_hash):
+        return {"to": SELLER, "amount_raw": PRICE, "result": None, "block_hash": block_hash,
+                "previous": "CD" * 32, "block": {"type": "state"}}
+
+    def test_duplicate_send_with_this_keys_result_null_is_final_exit_1(self):
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        other = pay402.idempotency_key(URL + "?b", SELLER, PRICE)
+        block_hash = "AB" * 32
+        content = json.dumps({
+            key: self._unsettled_record(block_hash),
+            other: {"to": SELLER, "amount_raw": PRICE, "block_hash": block_hash,
+                    "result": {"block_hash": block_hash, "amount_xno": "0.05", "to": SELLER,
+                               "confirmed": True}}})
+        with open(self.ledger(), "w") as handle:
+            handle.write(content)
+        before = len(self.node.published)
+        for _ in range(2):
+            code, out = run(self.argv(), Seller(challenge(entry())), self.node)
+            self.assertEqual((code, out.get("paid"), out.get("refused")),
+                             (1, False, "duplicate_send"), out)
+            self.assertNotIn("Retry", out["message"])
+            self.assertIn("remove that one entry", out["message"])
+            self.assertIn(key, out["message"])
+            self.assertIn(block_hash, out["message"])
+        self.assertEqual(len(self.node.published), before)
+        with open(self.ledger()) as handle:
+            self.assertEqual(handle.read(), content)
+
+    def test_send_did_not_land_names_what_pay402_can_do_not_a_new_key(self):
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        block_hash = "EF" * 32
+        with open(self.ledger(), "w") as handle:
+            json.dump({key: self._unsettled_record(block_hash)}, handle)
+        error = payments.ToolError("send_did_not_land", "block %s can never land. To pay, retry "
+                                   "with a NEW idempotency_key." % block_hash, 409)
+        with mock.patch.object(pay402.payments, "send", side_effect=error):
+            code, out = run(self.argv(), Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("refused")),
+                         (1, False, "send_did_not_land"), out)
+        self.assertNotIn("NEW idempotency", out["message"])
+        self.assertIn("cannot switch to a new one", out["message"])
+        self.assertIn("remove that one entry", out["message"])
+        self.assertIn(key, out["message"])
+        self.assertIn(self.ledger(), out["message"])
+
+    def test_readme_says_ctrl_c_is_held_for_the_whole_send_and_the_lock(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = " ".join(handle.read().split())
+        self.assertIn("it is held for the whole send, not only the save", readme)
+        self.assertIn("exclusive `flock` on `LEDGER.lock`", readme)
+        self.assertIn("Ctrl-C is held for the whole send", " ".join(pay402.__doc__.split()))
 
 
 def _hash(block):

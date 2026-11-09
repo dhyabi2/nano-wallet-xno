@@ -29,6 +29,8 @@ What it does, in order, and stops at the first thing that is wrong:
 
 Safe to re-run after a failure: the send is idempotent per (url, payTo, amount) through a small
 ledger file next to the key file, so a retry resubmits the SAME block instead of paying twice.
+Each payment's load -> send -> save of that ledger runs under an exclusive flock on
+LEDGER.lock (POSIX): a second run on the same ledger waits for the first, then sees its record.
 Exit codes: 0 ok, 1 refused before paying, 2 usage, 3 paid but the seller did not accept it,
 4 paid (or possibly paid) but the sent ledger could not be saved (`ledger-unsaved`),
 5 possibly paid and recorded: the block was handed to the node and its outcome is unknown (a
@@ -41,13 +43,16 @@ when the node's reply never arrived so publication itself is uncertain, plus "re
 "error": "ledger-unsaved", the block_hash, and the `unsaved_record` to add to the ledger by
 hand. Do NOT retry before adding it: a retry could pay twice. The seller is not called.
 Any other error during the send, Ctrl-C (KeyboardInterrupt) included, saves the signed block's
-record first and is then raised unchanged (any other exception: exit 5); Ctrl-C is held while
-the ledger is written. If that save fails as well, exit 4 with "paid":
+record first and is then raised unchanged (any other exception: exit 5); Ctrl-C is held for
+the whole send (every node call in it, up to the node client's timeouts) and until the ledger
+is written, then delivered. If that save fails as well, exit 4 with "paid":
 "unknown" is reported instead of the error. Nothing is saved, and no exit 4 is possible, when
 this run signed or settled nothing (a replay of a payment already recorded as settled, or a
 refusal before signing). Library callers: pay() raises PaidUnrecorded for exit 4; it is NOT
 a Refused subclass, so `except Refused` does not catch it. It raises PaidUnknown for exit 5,
-also not a Refused subclass; a retry that still cannot settle the block exits 5 again.
+also not a Refused subclass; a retry that reaches the send and still cannot settle the block
+exits 5 again (a refusal before the send, e.g. the price is now over --max-xno, is exit 1:
+this run signed nothing, but the earlier block may still have landed).
 """
 import base64
 import contextlib
@@ -114,9 +119,11 @@ class PaidUnknown(Exception):
 
 
 # Refusals that leave this payment's unsettled record in the ledger yet say for certain what
-# happened: send_did_not_land (a confirmed block took the slot, nothing was paid) and
-# idempotency_conflict (the record is for other terms; nothing of this call was signed).
-_SETTLED_REFUSALS = ("send_did_not_land", "idempotency_conflict")
+# happened: send_did_not_land (a confirmed block took the slot, nothing was paid),
+# idempotency_conflict (the record is for other terms; nothing of this call was signed) and
+# duplicate_send (the recorded block is already settled as another entry's one payment, so
+# it paid nothing for this URL). Each is final: a retry gets the same answer, so it exits 1.
+_SETTLED_REFUSALS = ("send_did_not_land", "idempotency_conflict", "duplicate_send")
 
 
 class _SigintDeferred:
@@ -468,15 +475,16 @@ def _ledger_directory_check(path):
 
 
 @contextlib.contextmanager
-def _file_lock(path):
-    """Exclusive flock on path + '.lock' (POSIX). Without fcntl it is a no-op."""
+def _file_lock(path, reason="pin-file-unwritable"):
+    """Exclusive flock on path + '.lock' (POSIX), waiting until it is free. Without fcntl it is
+    a no-op. A lock file that cannot be opened is refused as `reason`."""
     if fcntl is None:
         yield
         return
     try:
         fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as exc:
-        raise Refused("pin-file-unwritable", "cannot open lock file %s.lock: %s" % (path, exc)) from None
+        raise Refused(reason, "cannot open lock file %s.lock: %s" % (path, exc)) from None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -592,6 +600,57 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
         raise Refused(exc.reason, exc.message) from None
     ledger = ledger or os.path.expanduser(key_file) + ".pay402-sent.json"
     _ledger_directory_check(ledger)
+    # One payment's load -> send -> save runs under an exclusive lock on LEDGER.lock: a second
+    # run on the same ledger waits here, then loads the ledger only once the first run's record
+    # is on disk, so it settles that record instead of signing a second block, and its save
+    # cannot overwrite the first run's with a stale copy.
+    with _file_lock(ledger, "ledger-unwritable"):
+        result = _send_recorded(url, summary, source, keys, max_xno, node, ledger)
+    block_hash = result["block_hash"]
+    confirmed = wait_confirmed(node, block_hash, confirm_seconds, sleep)
+    header = payment_header(block_hash, entry, keys.get(source))
+    paid = {"paid": True, "block_hash": block_hash, "from": source, "to": summary["pay_to"],
+            "amount_xno": summary["amount_xno"], "confirmed": confirmed,
+            "replayed_send": bool(result.get("replayed")),
+            "receipt": "https://nanolooker.com/block/%s" % block_hash}
+    try:
+        status, _, body = fetcher(url, method=method, data=data,
+                                  headers={"X-PAYMENT": header, "Content-Type": "application/json"}
+                                  if data else {"X-PAYMENT": header})
+    except Exception as exc:
+        # The payment is made and recorded; only the seller call failed. Never a refusal.
+        reason = getattr(exc, "reason", type(exc).__name__)
+        return dict(paid, seller_status=None, seller_error=reason,
+                    seller_body=getattr(exc, "message", None) or str(exc))
+    return dict(paid, seller_status=status, seller_body=body.decode("utf-8", "replace")[:4000])
+
+
+def _settled_refusal(exc, ledger, key, record):
+    """The pay402 wording for a refusal that leaves this payment's record in the ledger and says
+    for certain that nothing was paid for this URL. payments.send advises a NEW idempotency key,
+    which pay402 cannot choose (the key is a hash of url, payTo and amount): every run of this
+    URL would be refused the same way while the record stays, so name the one way out."""
+    block_hash = (record or {}).get("block_hash") or "(not recorded)"
+    if exc.reason == "send_did_not_land":
+        what = ("block %s, recorded for this URL, can never land: a confirmed block took the "
+                "slot it was built on" % block_hash)
+    elif exc.reason == "duplicate_send":
+        what = ("block %s, recorded for this URL, is the identical block another entry of the "
+                "ledger already settled as its own payment (same account, frontier, seller and "
+                "amount sign to the same block, and one block is one payment)" % block_hash)
+    else:
+        return Refused(exc.reason, exc.message)
+    return Refused(exc.reason, "%s, so nothing was paid for this URL by it. pay402 derives the "
+                   "idempotency key from (url, payTo, amount) and cannot switch to a new one, so "
+                   "every run for this URL is refused like this while entry %r stays in the sent "
+                   "ledger %s. To pay this URL, remove that one entry (only %r) from the ledger "
+                   "by hand and run again: that signs a new block. Not paying"
+                   % (what, key, ledger, key))
+
+
+def _send_recorded(url, summary, source, keys, max_xno, node, ledger):
+    """Load the sent ledger, send (or settle) this payment's block and save the ledger. The
+    caller holds the ledger lock for all of it."""
     sent = _ledger_load(ledger)
     env = {"NANO_WALLET_ALLOW_SEND": "1", "NANO_WALLET_MAX_SEND_XNO": max_xno}
     key = idempotency_key(url, summary["pay_to"], int(summary["amount_raw"]))
@@ -612,9 +671,11 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
                            % (message, record.get("block_hash"), ledger),
                            {"block_hash": record.get("block_hash"), "ledger": ledger})
 
-    # Ctrl-C is held for the send and whichever save follows it, so one landing between the
-    # send returning (or raising) and the save starting cannot leave a signed block unsaved.
-    # A held Ctrl-C is delivered once the record is on disk (here, before the seller call).
+    # Ctrl-C is held for the WHOLE send (building the block and every node call it makes, which
+    # can last as long as the node client's timeouts) and whichever save follows it, so one
+    # landing between the send returning (or raising) and the save starting cannot leave a
+    # signed block unsaved. A held Ctrl-C is delivered once the record is on disk (here,
+    # before the seller call).
     with _SigintDeferred():
         try:
             result = payments.send(source, summary["pay_to"], summary["amount_xno"], key, node, keys,
@@ -634,7 +695,7 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
                 # and this retry could not settle it either (send_outcome_unknown, ledger
                 # unchanged). Either way the money may have moved: never paid false.
                 raise unknown(exc.reason, exc.message) from None
-            raise Refused(exc.reason, exc.message) from None
+            raise _settled_refusal(exc, ledger, key, sent.get(key)) from None
         except BaseException as exc:
             # Any other error (a bug, a node client raising something unexpected, Ctrl-C /
             # KeyboardInterrupt, SystemExit) may come after the block was handed to the node:
@@ -648,22 +709,7 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
                 if isinstance(exc, Exception):
                     raise unknown(type(exc).__name__, "%s: %s" % (type(exc).__name__, exc)) from exc
             raise
-    confirmed = wait_confirmed(node, block_hash, confirm_seconds, sleep)
-    header = payment_header(block_hash, entry, keys.get(source))
-    paid = {"paid": True, "block_hash": block_hash, "from": source, "to": summary["pay_to"],
-            "amount_xno": summary["amount_xno"], "confirmed": confirmed,
-            "replayed_send": bool(result.get("replayed")),
-            "receipt": "https://nanolooker.com/block/%s" % block_hash}
-    try:
-        status, _, body = fetcher(url, method=method, data=data,
-                                  headers={"X-PAYMENT": header, "Content-Type": "application/json"}
-                                  if data else {"X-PAYMENT": header})
-    except Exception as exc:
-        # The payment is made and recorded; only the seller call failed. Never a refusal.
-        reason = getattr(exc, "reason", type(exc).__name__)
-        return dict(paid, seller_status=None, seller_error=reason,
-                    seller_body=getattr(exc, "message", None) or str(exc))
-    return dict(paid, seller_status=status, seller_body=body.decode("utf-8", "replace")[:4000])
+    return result
 
 
 # ------------------------------------------------------------------- cli
