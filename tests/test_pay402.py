@@ -1261,6 +1261,144 @@ class LedgerLockAndFinalRefusals(Funded):
         self.assertIn("Ctrl-C is held for the whole send", " ".join(pay402.__doc__.split()))
 
 
+class LedgerLockFollowsTheRealFile(Funded):
+    """The ledger lock and save act on the file a symlinked ledger points at, the lock not
+    opening is a JSON refusal, and duplicate_send advice holds whether the holder settled."""
+
+    def argv(self):
+        return [URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"]
+
+    def real_ledger(self):
+        return self.key_file + ".pay402-sent.json"
+
+    def link_ledger(self):
+        return os.path.join(self.tmp.name, "via-link.json")
+
+    def _pay_in_thread(self, results, name, ledger):
+        summary = pay402.plan(URL, [entry()], "0.1")[0]
+        try:
+            results[name] = pay402.pay(URL, entry(), summary, self.key_file, "0.1", self.node,
+                                       ledger=ledger, fetcher=Seller(challenge(entry())),
+                                       sleep=lambda s: None)
+        except BaseException as exc:            # pragma: no cover - reported by the assertions
+            results[name] = exc
+
+    @unittest.skipUnless(hasattr(os, "symlink") and pay402.fcntl is not None,
+                         "needs symlinks and fcntl")
+    def test_symlink_and_real_path_share_one_lock_and_never_pay_twice(self):
+        with open(self.real_ledger(), "w") as handle:
+            handle.write("{}")
+        os.symlink(self.real_ledger(), self.link_ledger())
+        real_send = payments.send
+        first_sent, release = threading.Event(), threading.Event()
+        calls = []
+
+        def send(*args, **kwargs):
+            calls.append(threading.current_thread().name)
+            result = real_send(*args, **kwargs)
+            if len(calls) == 1:
+                first_sent.set()
+                release.wait(10)
+            return result
+        before = len(self.node.published)
+        results = {}
+        with mock.patch.object(pay402.payments, "send", side_effect=send):
+            a = threading.Thread(target=self._pay_in_thread,
+                                 args=(results, "A", self.real_ledger()), name="A")
+            a.start()
+            self.assertTrue(first_sent.wait(10))
+            b = threading.Thread(target=self._pay_in_thread,
+                                 args=(results, "B", self.link_ledger()), name="B")
+            b.start()
+            b.join(1.0)
+            seen = list(calls)
+            release.set()
+            a.join(10)
+            b.join(10)
+        self.assertEqual(seen, ["A"], "the run through the link did not wait for the lock")
+        self.assertEqual(len(self.node.published) - before, 1,
+                         "a symlinked ledger and its real path paid twice: %r" % results)
+        self.assertEqual(results["A"]["block_hash"], results["B"]["block_hash"], results)
+        self.assertTrue(results["B"]["replayed_send"], results)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
+    def test_saving_through_a_symlinked_ledger_writes_the_real_file_and_keeps_the_link(self):
+        with open(self.real_ledger(), "w") as handle:
+            handle.write("{}")
+        os.symlink(self.real_ledger(), self.link_ledger())
+        code, out = run(self.argv() + ["--ledger", self.link_ledger()],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid")), (0, True), out)
+        self.assertTrue(os.path.islink(self.link_ledger()), "the link was replaced by a file")
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        with open(self.real_ledger()) as handle:
+            self.assertEqual(json.load(handle)[key]["result"]["block_hash"], out["block_hash"])
+        # A second run through the real path sees the record and does not pay again.
+        before = len(self.node.published)
+        code, out2 = run(self.argv(), Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out2["block_hash"]), (0, out["block_hash"]), out2)
+        self.assertEqual(len(self.node.published), before)
+
+    @unittest.skipUnless(pay402.fcntl is not None, "needs fcntl")
+    def test_flock_failure_is_a_json_refusal_before_signing(self):
+        import errno
+        before = len(self.node.published)
+        failing = OSError(errno.ENOLCK, "No locks available")
+        with mock.patch.object(pay402.fcntl, "flock", side_effect=failing):
+            code, out = run(self.argv(), Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("refused")),
+                         (1, False, "ledger-unwritable"), out)
+        self.assertIn("No locks available", out["message"])
+        self.assertEqual(len(self.node.published), before, "nothing is signed or published")
+        self.assertFalse(os.path.exists(self.real_ledger()))
+
+    def _block_this_run_would_sign(self):
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        # Sign this URL's block against a throwaway copy of the ledger and node state: the
+        # block hash depends only on account, frontier, destination and amount.
+        import copy
+        clone = copy.deepcopy(self.node)
+        sent = {}
+        env = {"NANO_WALLET_ALLOW_SEND": "1", "NANO_WALLET_MAX_SEND_XNO": "0.1"}
+        source = keystore.KeyStore()
+        address = source.load_file(self.key_file)
+        result = payments.send(address, SELLER, "0.05", key, clone, source, sent, env=env)
+        return result["block_hash"]
+
+    def test_duplicate_send_held_by_an_unsettled_entry_says_retry_that_one_first(self):
+        block_hash = self._block_this_run_would_sign()
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        other = pay402.idempotency_key(URL + "?b", SELLER, PRICE)
+        content = json.dumps({other: {"to": SELLER, "amount_raw": PRICE, "result": None,
+                                      "block_hash": block_hash, "previous": "CD" * 32,
+                                      "block": {"type": "state"}}})
+        with open(self.real_ledger(), "w") as handle:
+            handle.write(content)
+        before = len(self.node.published)
+        code, out = run(self.argv(), Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out.get("paid"), out.get("refused")),
+                         (1, False, "duplicate_send"), out)
+        message = out["message"]
+        self.assertNotIn("already settled", message)
+        self.assertNotIn("remove that one entry", message)
+        self.assertIn("not settled", message)
+        self.assertIn(other, message)
+        self.assertIn("first", message)
+        self.assertEqual(len(self.node.published), before)
+        with open(self.real_ledger()) as handle:
+            self.assertEqual(handle.read(), content)
+
+    def test_readme_upgrading_lists_the_new_exit_codes_and_exceptions(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = " ".join(handle.read().split())
+        for text in ("### Upgrading: new exit codes and exceptions for --pay",
+                     "This used to be exit 1 with `\"paid\": false`",
+                     "Compare `out[\"paid\"] == True`",
+                     "except (Refused, PaidUnknown, PaidUnrecorded)",
+                     "`.lock` files are left next to the sent ledger"):
+            self.assertIn(text, readme)
+
+
 def _hash(block):
     return fakenode._hash_of(block)
 

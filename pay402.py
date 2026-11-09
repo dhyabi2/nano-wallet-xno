@@ -472,21 +472,50 @@ def _ledger_directory_check(path):
                       "so a payment could not be recorded; fix its permissions; do NOT start a "
                       "new empty ledger elsewhere if payments were already recorded: not paying"
                       % (directory, path))
+    if os.path.islink(path):
+        # A symlinked ledger is saved in place of the file it points at (see _ledger_save), so
+        # that file's directory must be writable too.
+        real_directory = os.path.dirname(os.path.realpath(path))
+        if os.path.isdir(real_directory) and not os.access(real_directory, os.W_OK | os.X_OK):
+            raise Refused("ledger-unwritable", "sent ledger %s is a symlink to %s, whose "
+                          "directory %s is not writable, so a payment could not be recorded; "
+                          "fix its permissions: not paying"
+                          % (path, os.path.realpath(path), real_directory))
+
+
+def _lock_path(path):
+    """The lock file for `path`: next to the file it really names, so a symlink to it, a path
+    through a symlinked directory and the real path all take the same lock. A directory that
+    does not exist as typed (e.g. 'missing/..') is left as typed, never resolved textually.
+    A dangling link is locked beside the link (its load refuses it), not at its target."""
+    if os.path.exists(path):
+        return os.path.realpath(path) + ".lock"
+    directory = os.path.dirname(path) or os.curdir
+    if os.path.isdir(directory):
+        return os.path.join(os.path.realpath(directory), os.path.basename(path)) + ".lock"
+    return path + ".lock"
 
 
 @contextlib.contextmanager
 def _file_lock(path, reason="pin-file-unwritable"):
-    """Exclusive flock on path + '.lock' (POSIX), waiting until it is free. Without fcntl it is
-    a no-op. A lock file that cannot be opened is refused as `reason`."""
+    """Exclusive flock on the lock file for path (_lock_path: the real file's path + '.lock';
+    POSIX), waiting until it is free. Without fcntl it is a no-op. A lock file that cannot be
+    opened or locked is refused as `reason`, before anything is signed."""
     if fcntl is None:
         yield
         return
+    lock = _lock_path(path)
     try:
-        fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as exc:
-        raise Refused(reason, "cannot open lock file %s.lock: %s" % (path, exc)) from None
+        raise Refused(reason, "cannot open lock file %s: %s: not paying" % (lock, exc)) from None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        # e.g. ENOLCK on a filesystem without flock: refuse instead of a bare traceback.
+        os.close(fd)
+        raise Refused(reason, "cannot lock %s: %s: not paying" % (lock, exc)) from None
+    try:
         yield
     finally:
         os.close(fd)
@@ -494,7 +523,12 @@ def _file_lock(path, reason="pin-file-unwritable"):
 
 def _ledger_save(path, sent):
     """Atomic replace through a unique temp file in the same directory (mkstemp: O_EXCL, 0600,
-    so a planted symlink at a predictable name is never followed)."""
+    so a planted symlink at a predictable name is never followed). A path that is a symlink
+    (a ledger linked to its real file) is saved in place of the file it points at, keeping the
+    link: os.replace on the link itself would turn it into a plain file and leave the real
+    ledger without the record. The pin file refuses links before it gets here."""
+    if os.path.islink(path):
+        path = os.path.realpath(path)
     directory = _ledger_directory(path)
     fd, temp = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), suffix=".tmp", dir=directory)
     try:
@@ -625,19 +659,18 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
     return dict(paid, seller_status=status, seller_body=body.decode("utf-8", "replace")[:4000])
 
 
-def _settled_refusal(exc, ledger, key, record):
+def _settled_refusal(exc, ledger, key, sent):
     """The pay402 wording for a refusal that leaves this payment's record in the ledger and says
     for certain that nothing was paid for this URL. payments.send advises a NEW idempotency key,
     which pay402 cannot choose (the key is a hash of url, payTo and amount): every run of this
     URL would be refused the same way while the record stays, so name the one way out."""
+    record = sent.get(key)
     block_hash = (record or {}).get("block_hash") or "(not recorded)"
+    if exc.reason == "duplicate_send":
+        return _duplicate_refusal(exc, ledger, key, sent)
     if exc.reason == "send_did_not_land":
         what = ("block %s, recorded for this URL, can never land: a confirmed block took the "
                 "slot it was built on" % block_hash)
-    elif exc.reason == "duplicate_send":
-        what = ("block %s, recorded for this URL, is the identical block another entry of the "
-                "ledger already settled as its own payment (same account, frontier, seller and "
-                "amount sign to the same block, and one block is one payment)" % block_hash)
     else:
         return Refused(exc.reason, exc.message)
     return Refused(exc.reason, "%s, so nothing was paid for this URL by it. pay402 derives the "
@@ -646,6 +679,53 @@ def _settled_refusal(exc, ledger, key, record):
                    "ledger %s. To pay this URL, remove that one entry (only %r) from the ledger "
                    "by hand and run again: that signs a new block. Not paying"
                    % (what, key, ledger, key))
+
+
+def _duplicate_refusal(exc, ledger, key, sent):
+    """duplicate_send: this URL's block is the identical block another ledger entry holds.
+    payments.send raises it whether or not that holder has settled, so the advice depends on
+    which: an unsettled holder is retried first (removing anything then could pay twice)."""
+    record = sent.get(key)
+    # The block: this URL's recorded one, or (nothing recorded yet) the one payments.send names.
+    block_hash = (record or {}).get("block_hash")
+    if not block_hash:
+        found = re.search(r"block ([0-9A-Fa-f]{64})", exc.message or "")
+        block_hash = found.group(1) if found else None
+    holder = None
+    for other, other_record in sent.items():
+        if (other == key or not isinstance(other_record, dict) or not block_hash
+                or str(other_record.get("block_hash") or "").upper() != block_hash.upper()):
+            continue
+        # Of several holders, an unsettled one decides the advice: retry it first.
+        if holder is None or other_record.get("result") is None:
+            holder = other
+    holder_record = sent.get(holder) or {}
+    block_hash = block_hash or "(unknown)"
+    same = ("(same account, frontier, seller and amount sign to the same block, and one block "
+            "is one payment)")
+    if holder is None or holder_record.get("result") is None:
+        who = repr(holder) if holder is not None else "(another entry)"
+        return Refused(exc.reason, "this URL's payment would be block %s, the identical block "
+                       "ledger entry %s holds and has not settled yet %s, so nothing was paid "
+                       "for this URL by this run. Retry first the URL whose payment is recorded "
+                       "under %s (run pay402 for it with this same sent ledger %s): that "
+                       "settles whether that block landed. Do NOT remove any ledger entry "
+                       "while it is not settled: that could pay twice. Then run this URL again. "
+                       "Not paying" % (block_hash, who, same, who, ledger))
+    if record is None:
+        return Refused(exc.reason, "this URL's payment would be block %s, the identical block "
+                       "ledger entry %r already settled as its own payment %s, so nothing was "
+                       "paid for this URL by this run and nothing was recorded for it. Run it "
+                       "again once that block is confirmed (the account's frontier moves past "
+                       "it and a new block is signed). Not paying" % (block_hash, holder, same))
+    return Refused(exc.reason, "block %s, recorded for this URL, is the identical block ledger "
+                   "entry %r already settled as its own payment %s, so nothing was paid for "
+                   "this URL by it. pay402 derives the idempotency key from (url, payTo, "
+                   "amount) and cannot switch to a new one, so every run for this URL is "
+                   "refused like this while entry %r stays in the sent ledger %s. To pay this "
+                   "URL, remove that one entry (only %r) from the ledger by hand and run "
+                   "again: that signs a new block. Not paying"
+                   % (block_hash, holder, same, key, ledger, key))
 
 
 def _send_recorded(url, summary, source, keys, max_xno, node, ledger):
@@ -695,7 +775,7 @@ def _send_recorded(url, summary, source, keys, max_xno, node, ledger):
                 # and this retry could not settle it either (send_outcome_unknown, ledger
                 # unchanged). Either way the money may have moved: never paid false.
                 raise unknown(exc.reason, exc.message) from None
-            raise _settled_refusal(exc, ledger, key, sent.get(key)) from None
+            raise _settled_refusal(exc, ledger, key, sent) from None
         except BaseException as exc:
             # Any other error (a bug, a node client raising something unexpected, Ctrl-C /
             # KeyboardInterrupt, SystemExit) may come after the block was handed to the node:
