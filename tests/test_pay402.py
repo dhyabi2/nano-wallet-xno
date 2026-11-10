@@ -933,10 +933,16 @@ class SentLedgerFailsClosed(Funded):
     def test_ctrl_c_during_the_success_save_is_held_until_the_record_is_on_disk(self):
         ledger = self.key_file + ".pay402-sent.json"
         before = len(self.node.published)
+        seller = Seller(challenge(entry()))
         with self._sigint_inside_fsync():
-            with self.assertRaises(KeyboardInterrupt):
-                run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
-                    Seller(challenge(entry())), self.node)
+            # The held Ctrl-C is delivered once the record is on disk. The block went out, so
+            # it is exit 5 with the payment's JSON, not a bare KeyboardInterrupt (exit 1).
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            seller, self.node)
+        self.assertEqual((code, out["paid"], out["recorded"], out["error"]),
+                         (5, "unknown", True, "interrupted"), out)
+        self.assertEqual(out["block_hash"], _hash(self.node.published[-1]))
+        self.assertEqual(len(seller.requests), 1, "the seller is not called after Ctrl-C")
         self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
         key = pay402.idempotency_key(URL, SELLER, PRICE)
         self.assertTrue(os.path.exists(ledger), "Ctrl-C mid-save left the block unrecorded")
@@ -1401,6 +1407,103 @@ class LedgerLockFollowsTheRealFile(Funded):
 
 def _hash(block):
     return fakenode._hash_of(block)
+
+
+class ExitOneMeansNoNewBlock(Funded):
+    """Once the block is published and recorded, nothing that goes wrong while confirming or
+    calling the seller may end the run as exit 1 (a traceback, or a bare KeyboardInterrupt)."""
+
+    def pay(self, seller=None):
+        return run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                   seller or Seller(challenge(entry())), self.node)
+
+    def test_a_broken_connection_while_confirming_still_reports_the_payment(self):
+        import http.client
+        with mock.patch.object(self.node, "block_info",
+                               side_effect=http.client.IncompleteRead(b"")):
+            code, out = self.pay()
+        self.assertEqual((code, out["paid"], out["confirmed"]), (0, True, False), out)
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_a_non_object_block_info_reply_while_confirming_still_reports_the_payment(self):
+        with mock.patch.object(self.node, "block_info", return_value=["not", "an", "object"]):
+            code, out = self.pay()
+        self.assertEqual((code, out["paid"], out["confirmed"]), (0, True, False), out)
+
+    def test_a_node_without_block_info_is_not_polled(self):
+        calls = []
+
+        def missing(block_hash):
+            calls.append(block_hash)
+            raise NotImplementedError
+        with mock.patch.object(self.node, "block_info", side_effect=missing):
+            code, out = self.pay()
+        self.assertEqual((code, out["confirmed"], len(calls)), (0, False, 1), out)
+
+    def test_ctrl_c_while_confirming_prints_the_payment_exit_5_and_a_retry_pays_once(self):
+        seller = Seller(challenge(entry()))
+        with mock.patch.object(self.node, "block_info", side_effect=KeyboardInterrupt()):
+            code, out = self.pay(seller)
+        self.assertEqual((code, out["paid"], out["recorded"], out["error"]),
+                         (5, "unknown", True, "interrupted"), out)
+        self.assertEqual(out["block_hash"], _hash(self.node.published[-1]))
+        self.assertEqual((out["to"], out["amount_xno"]), (SELLER, "0.05"))
+        self.assertEqual(len(seller.requests), 1, "the seller is not called after Ctrl-C")
+        code, out = self.pay()
+        self.assertEqual((code, out["paid"], out["replayed_send"]), (0, True, True), out)
+        self.assertEqual(len(self.sends()), 1, "a retry after Ctrl-C paid twice")
+
+    def test_ctrl_c_during_the_seller_call_prints_the_payment_exit_5(self):
+        seller = Seller(challenge(entry()))
+
+        def fetcher(url, method="GET", data=None, headers=None, timeout=20):
+            if "X-PAYMENT" in (headers or {}):
+                raise KeyboardInterrupt
+            return seller(url, method, data, headers, timeout)
+        code, out = self.pay(fetcher)
+        self.assertEqual((code, out["paid"], out["recorded"], out["error"]),
+                         (5, "unknown", True, "interrupted"), out)
+        self.assertIn("during the seller call", out["message"])
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_pay_raises_paid_unknown_not_keyboard_interrupt(self):
+        summary, entry_ = pay402.plan(URL, challenge(entry())["accepts"], "0.1")
+        with mock.patch.object(self.node, "block_info", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(pay402.PaidUnknown) as caught:
+                pay402.pay(URL, entry_, summary, self.key_file, "0.1", self.node,
+                           fetcher=Seller(challenge(entry())), sleep=lambda s: None)
+        self.assertEqual(caught.exception.reason, "interrupted")
+
+
+class HardLinkedFilesAreRefused(Funded):
+    """The save replaces the file, which breaks a hard link: refuse a linked ledger or pin file."""
+
+    def test_a_hard_linked_ledger_is_refused_before_signing(self):
+        ledger = self.key_file + ".pay402-sent.json"
+        with open(ledger, "w") as handle:
+            handle.write("{}")
+        os.link(ledger, os.path.join(self.tmp.name, "other-name.json"))
+        before = len(self.node.published)
+        code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                        Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out["paid"], out["refused"]), (1, False, "ledger-unreadable"), out)
+        self.assertIn("hard links", out["message"])
+        self.assertEqual(len(self.node.published), before, "nothing may be signed")
+        with open(ledger) as handle:
+            self.assertEqual(handle.read(), "{}")
+
+    def test_a_hard_linked_pin_file_is_refused(self):
+        pins = os.path.join(self.tmp.name, "pins.json")
+        code, out = run([URL, "--max-xno", "0.1", "--pin-file", pins], Seller(challenge(entry())))
+        self.assertEqual(code, 0, out)
+        os.link(pins, os.path.join(self.tmp.name, "pins-other.json"))
+        with open(pins) as handle:
+            content = handle.read()
+        code, out = run([URL, "--max-xno", "0.1", "--pin-file", pins], Seller(challenge(entry())))
+        self.assertEqual((code, out["paid"], out["refused"]), (1, False, "pin-file-unreadable"), out)
+        self.assertIn("hard links", out["message"])
+        with open(pins) as handle:
+            self.assertEqual(handle.read(), content)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ the test-suite substitutes an in-memory fake. No test in this repository
 opens a socket.
 """
 
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -271,13 +272,23 @@ class HttpNanoNode(NanoNode):
                 "node_unreachable",
                 "could not reach the Nano node at %s: %s" % (host_of(self.url), exc.reason),
             ) from None
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, http.client.HTTPException) as exc:
+            # HTTPException: the connection broke mid-reply (IncompleteRead, a bad status
+            # line). It is not an OSError, and letting it out would read as a crash.
             raise NodeError(
                 "node_unreachable",
                 "the Nano node at %s answered something unusable: %s"
                 % (host_of(self.url), exc),
             ) from None
-        if isinstance(answer, dict) and "error" in answer:
+        if not isinstance(answer, dict):
+            # Every call reads the reply as an object; a list, string or number is not an
+            # answer to any of them.
+            raise NodeError(
+                "node_error",
+                "the Nano node at %s answered a JSON %s, not an object"
+                % (host_of(self.url), type(answer).__name__),
+            )
+        if "error" in answer:
             # A real node answers `account_info` for an account that has never
             # received with this error, not with an empty account. It is the
             # state every new wallet starts in, so it is an empty answer here
