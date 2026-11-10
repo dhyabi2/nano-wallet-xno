@@ -131,7 +131,12 @@ class KeyStore:
             # A zero-length or half-written key file looks like a key and is not.
             os.unlink(path)
             raise _unwritable("write_key_file", path, exc) from None
-        mode = stat.S_IMODE(os.stat(path).st_mode)
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError as exc:
+            # A mode that cannot be checked is not known to be 600.
+            os.unlink(path)
+            raise _unwritable("check_key_file_mode", path, exc) from None
         if mode & 0o077:
             # A umask or a filesystem that ignores the mode would leave the key
             # readable by other users. Delete it rather than report success.
