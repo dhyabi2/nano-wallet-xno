@@ -1466,13 +1466,92 @@ class ExitOneMeansNoNewBlock(Funded):
         self.assertIn("during the seller call", out["message"])
         self.assertEqual(len(self.sends()), 1)
 
-    def test_pay_raises_paid_unknown_not_keyboard_interrupt(self):
+    def test_pay_raises_a_keyboard_interrupt_carrying_the_payment(self):
         summary, entry_ = pay402.plan(URL, challenge(entry())["accepts"], "0.1")
         with mock.patch.object(self.node, "block_info", side_effect=KeyboardInterrupt()):
-            with self.assertRaises(pay402.PaidUnknown) as caught:
+            with self.assertRaises(KeyboardInterrupt) as caught:
                 pay402.pay(URL, entry_, summary, self.key_file, "0.1", self.node,
                            fetcher=Seller(challenge(entry())), sleep=lambda s: None)
-        self.assertEqual(caught.exception.reason, "interrupted")
+        exc = caught.exception
+        self.assertIsInstance(exc, pay402.PaidInterrupted)
+        self.assertNotIsInstance(exc, Exception)
+        self.assertNotIsInstance(exc, pay402.PaidUnknown)
+        self.assertEqual((exc.reason, exc.paid), ("interrupted", "unknown"))
+        self.assertEqual(exc.payment["block_hash"], _hash(self.node.published[-1]))
+        self.assertEqual((exc.payment["to"], exc.payment["amount_xno"]), (SELLER, "0.05"))
+        self.assertIs(exc.payment, exc.extra)
+
+    def test_paid_interrupted_is_a_keyboard_interrupt_not_an_exception(self):
+        self.assertTrue(issubclass(pay402.PaidInterrupted, KeyboardInterrupt))
+        self.assertFalse(issubclass(pay402.PaidInterrupted, Exception))
+
+    def test_readme_batch_loop_stops_on_ctrl_c_after_the_first_payment(self):
+        """The README's catch-all tuple over two URLs, Ctrl-C while confirming URL 1: the
+        KeyboardInterrupt escapes the loop and URL 2 is never paid (one send)."""
+        summary, entry_ = pay402.plan(URL, challenge(entry())["accepts"], "0.1")
+        calls = {"n": 0}
+        real = self.node.block_info
+
+        def block_info(block_hash):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise KeyboardInterrupt     # the user presses Ctrl-C to stop the batch
+            return real(block_hash)
+        handled = []
+        with mock.patch.object(self.node, "block_info", side_effect=block_info):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                for url in (URL, URL + "/second"):
+                    try:
+                        pay402.pay(url, entry_, summary, self.key_file, "0.1", self.node,
+                                   fetcher=Seller(challenge(entry())), sleep=lambda s: None,
+                                   confirm_seconds=0)
+                    except (pay402.Refused, pay402.PaidUnknown, pay402.PaidUnrecorded) as exc:
+                        handled.append((url, type(exc).__name__))
+        self.assertEqual(handled, [], "the README handler swallowed the Ctrl-C")
+        self.assertEqual(len(self.sends()), 1, "the batch went on to pay the next URL")
+        self.assertEqual(caught.exception.payment["block_hash"], _hash(self.node.published[-1]))
+
+    def test_ctrl_c_while_signing_the_payment_header_prints_the_payment_exit_5(self):
+        seller = Seller(challenge(entry()))
+        with mock.patch.object(pay402, "payment_header", side_effect=KeyboardInterrupt()):
+            code, out = self.pay(seller)
+        self.assertEqual((code, out["paid"], out["recorded"], out["error"]),
+                         (5, "unknown", True, "interrupted"), out)
+        self.assertIn("before the seller was called", out["message"])
+        self.assertEqual(len(seller.requests), 1, "the seller is not called after Ctrl-C")
+        code, out = self.pay()
+        self.assertEqual((code, out["replayed_send"]), (0, True), out)
+        self.assertEqual(len(self.sends()), 1, "a retry after Ctrl-C paid twice")
+
+    def test_ctrl_c_in_the_ledger_lock_release_prints_the_payment_exit_5(self):
+        real_lock = pay402._file_lock
+        fired = []
+
+        @contextlib.contextmanager
+        def file_lock(path, reason="pin-file-unwritable"):
+            with real_lock(path, reason):
+                yield
+            if reason == "ledger-unwritable" and not fired:
+                fired.append(path)
+                os.kill(os.getpid(), signal.SIGINT)   # a real Ctrl-C as the lock is released
+        with mock.patch.object(pay402, "_file_lock", file_lock):
+            code, out = self.pay()
+        self.assertTrue(fired)
+        self.assertEqual((code, out["paid"], out["recorded"], out["error"]),
+                         (5, "unknown", True, "interrupted"), out)
+        self.assertEqual(out["block_hash"], _hash(self.node.published[-1]))
+        code, out = self.pay()
+        self.assertEqual((code, out["replayed_send"]), (0, True), out)
+        self.assertEqual(len(self.sends()), 1, "a retry after Ctrl-C paid twice")
+
+    def test_readme_states_the_python_and_cli_ctrl_c_contracts(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = " ".join(handle.read().split())
+        self.assertIn("`pay402.pay()` raises `pay402.PaidInterrupted`, a subclass of "
+                      "`KeyboardInterrupt` (NOT of `Exception`, and not `PaidUnknown`)", readme)
+        self.assertIn("Only the CLI's `main()` turns it into exit 5.", readme)
+        self.assertNotIn("(`pay402.PaidUnknown` from Python): Ctrl-C", readme)
+        self.assertIn("PaidInterrupted, a KeyboardInterrupt subclass", pay402.__doc__)
 
 
 class HardLinkedFilesAreRefused(Funded):

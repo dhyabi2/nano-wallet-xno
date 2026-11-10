@@ -46,12 +46,16 @@ Any other error during the send, Ctrl-C (KeyboardInterrupt) included, saves the 
 record first and is then raised unchanged (any other exception: exit 5); Ctrl-C is held for
 the whole send (every node call in it, up to the node client's timeouts) and until the ledger
 is written, then delivered (after a send that succeeded: exit 5, "error": "interrupted", as is
-a Ctrl-C during the confirmation wait or the seller call). If that save fails as well, exit 4 with "paid":
+a Ctrl-C anywhere after the save until the seller answers: the lock release, the confirmation
+wait, signing the payment header, the seller call). If that save fails as well, exit 4 with "paid":
 "unknown" is reported instead of the error. Nothing is saved, and no exit 4 is possible, when
 this run signed or settled nothing (a replay of a payment already recorded as settled, or a
 refusal before signing). Library callers: pay() raises PaidUnrecorded for exit 4; it is NOT
 a Refused subclass, so `except Refused` does not catch it. It raises PaidUnknown for exit 5,
-also not a Refused subclass; a retry that reaches the send and still cannot settle the block
+also not a Refused subclass. A Ctrl-C after the record is saved is NOT turned into an
+Exception by pay(): it raises PaidInterrupted, a KeyboardInterrupt subclass whose `payment`
+attribute holds block_hash, ledger, from, to, amount_xno and receipt, so it stops a batch
+loop like any Ctrl-C; only main() prints it as exit 5 "interrupted". Otherwise, for exit 5, a retry that reaches the send and still cannot settle the block
 exits 5 again (a refusal before the send, e.g. the price is now over --max-xno, is exit 1:
 this run signed nothing, but the earlier block may still have landed).
 """
@@ -116,6 +120,22 @@ class PaidUnknown(Exception):
     def __init__(self, reason, message, extra=None):
         super().__init__(message)
         self.reason, self.message, self.extra = reason, message, dict(extra or {})
+        self.paid = "unknown"
+
+
+class PaidInterrupted(KeyboardInterrupt):
+    """Ctrl-C landed after this payment's block was handed to the node and its record was saved.
+    A KeyboardInterrupt subclass, NOT an Exception: from Python a Ctrl-C keeps stopping the
+    caller (a batch loop catching `except (Refused, PaidUnknown, PaidUnrecorded)` or even
+    `except Exception` does not swallow it and pay the next URL). It carries the payment:
+    `payment` (the same dict as `extra`: block_hash, ledger, from, to, amount_xno, receipt),
+    `paid` ("unknown"), `reason` ("interrupted") and `message`. Only the CLI main() turns it
+    into exit 5 JSON. A retry with the same ledger is safe: it reuses that same block."""
+
+    def __init__(self, message, extra=None):
+        super().__init__(message)
+        self.reason, self.message, self.extra = "interrupted", message, dict(extra or {})
+        self.payment = self.extra
         self.paid = "unknown"
 
 
@@ -648,12 +668,13 @@ def wait_confirmed(node, block_hash, seconds=30, sleep=time.sleep):
 def _interrupted_after_send(result, source, summary, ledger, seller=False):
     """Ctrl-C once this payment's block was published and its record saved (a Ctrl-C held during
     the send and delivered after the save, during the confirmation wait, or during the seller
-    call): exit 5 with the payment's JSON, never a bare KeyboardInterrupt that exits 1 for a
-    payment that went out."""
+    call, or anywhere between the save and the seller's reply): a PaidInterrupted, which is a
+    KeyboardInterrupt carrying the payment. The CLI main() alone turns it into exit 5 JSON,
+    never a bare traceback that exits 1 for a payment that went out."""
     block_hash = result["block_hash"]
     when = ("during the seller call (the seller may or may not have received the payment "
             "header)" if seller else "before the seller was called")
-    return PaidUnknown("interrupted", "interrupted (Ctrl-C) after block %s was handed to the node "
+    return PaidInterrupted("interrupted (Ctrl-C) after block %s was handed to the node "
                        "and recorded in the sent ledger %s, %s. A retry with the same ledger is "
                        "safe: it reuses that same block (one hash, so at most one payment) and "
                        "then calls the seller" % (block_hash, ledger, when),
@@ -675,29 +696,39 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
     # run on the same ledger waits here, then loads the ledger only once the first run's record
     # is on disk, so it settles that record instead of signing a second block, and its save
     # cannot overwrite the first run's with a stale copy.
-    with _file_lock(ledger, "ledger-unwritable"):
-        result = _send_recorded(url, summary, source, keys, max_xno, node, ledger)
-    block_hash = result["block_hash"]
+    # From the moment _send_recorded returns (the record is on disk) until the seller has
+    # answered, a Ctrl-C anywhere - the lock release, the confirmation wait, signing the
+    # payment header, the seller call - is raised as PaidInterrupted (a KeyboardInterrupt
+    # carrying the payment), never a bare KeyboardInterrupt and never an Exception.
+    result = None
+    seller = False
     try:
+        with _file_lock(ledger, "ledger-unwritable"):
+            result = _send_recorded(url, summary, source, keys, max_xno, node, ledger)
+        block_hash = result["block_hash"]
         confirmed = wait_confirmed(node, block_hash, confirm_seconds, sleep)
+        header = payment_header(block_hash, entry, keys.get(source))
+        paid = {"paid": True, "block_hash": block_hash, "from": source, "to": summary["pay_to"],
+                "amount_xno": summary["amount_xno"], "confirmed": confirmed,
+                "replayed_send": bool(result.get("replayed")),
+                "receipt": "https://nanolooker.com/block/%s" % block_hash}
+        seller = True
+        try:
+            status, _, body = fetcher(url, method=method, data=data,
+                                      headers={"X-PAYMENT": header,
+                                               "Content-Type": "application/json"}
+                                      if data else {"X-PAYMENT": header})
+        except Exception as exc:
+            # The payment is made and recorded; only the seller call failed. Never a refusal.
+            reason = getattr(exc, "reason", type(exc).__name__)
+            return dict(paid, seller_status=None, seller_error=reason,
+                        seller_body=getattr(exc, "message", None) or str(exc))
+    except PaidInterrupted:
+        raise
     except KeyboardInterrupt:
-        raise _interrupted_after_send(result, source, summary, ledger) from None
-    header = payment_header(block_hash, entry, keys.get(source))
-    paid = {"paid": True, "block_hash": block_hash, "from": source, "to": summary["pay_to"],
-            "amount_xno": summary["amount_xno"], "confirmed": confirmed,
-            "replayed_send": bool(result.get("replayed")),
-            "receipt": "https://nanolooker.com/block/%s" % block_hash}
-    try:
-        status, _, body = fetcher(url, method=method, data=data,
-                                  headers={"X-PAYMENT": header, "Content-Type": "application/json"}
-                                  if data else {"X-PAYMENT": header})
-    except KeyboardInterrupt:
-        raise _interrupted_after_send(result, source, summary, ledger, seller=True) from None
-    except Exception as exc:
-        # The payment is made and recorded; only the seller call failed. Never a refusal.
-        reason = getattr(exc, "reason", type(exc).__name__)
-        return dict(paid, seller_status=None, seller_error=reason,
-                    seller_body=getattr(exc, "message", None) or str(exc))
+        if result is None:
+            raise       # before the record was saved: _send_recorded's own contract
+        raise _interrupted_after_send(result, source, summary, ledger, seller=seller) from None
     return dict(paid, seller_status=status, seller_body=body.decode("utf-8", "replace")[:4000])
 
 
@@ -917,6 +948,10 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
         out(dict(exc.extra, paid=exc.paid, recorded=False, error=exc.reason, message=exc.message))
         return 4
     except PaidUnknown as exc:
+        out(dict(exc.extra, paid="unknown", recorded=True, error=exc.reason, message=exc.message))
+        return 5
+    except PaidInterrupted as exc:
+        # The CLI alone turns a Ctrl-C after the save into exit 5 JSON; pay() raises it.
         out(dict(exc.extra, paid="unknown", recorded=True, error=exc.reason, message=exc.message))
         return 5
     except Refused as exc:
