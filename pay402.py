@@ -45,9 +45,13 @@ hand. Do NOT retry before adding it: a retry could pay twice. The seller is not 
 Any other error during the send, Ctrl-C (KeyboardInterrupt) included, saves the signed block's
 record first and is then raised unchanged (any other exception: exit 5); Ctrl-C is held for
 the whole send (every node call in it, up to the node client's timeouts) and until the ledger
-is written, then delivered (after a send that succeeded: exit 5, "error": "interrupted", as is
-a Ctrl-C anywhere after the save until the seller answers: the lock release, the confirmation
-wait, signing the payment header, the seller call). If that save fails as well, exit 4 with "paid":
+is written, then delivered, never dropped (the JSON says "error": "interrupted", as it does
+for a Ctrl-C anywhere after the save until the seller answers: the lock release, the
+confirmation wait, signing the payment header, the seller call; when the send itself ended in
+an error, "interrupted_error" names it). After printing that JSON the CLI ends itself by
+SIGINT, as an uncaught Ctrl-C does, so a shell loop over pay402 stops (shell status 130; where
+SIGINT cannot be delivered, e.g. Windows, it exits 5, or 4/1 when the send's own error was
+ledger-unsaved/a refusal). If that save fails as well, exit 4 with "paid":
 "unknown" is reported instead of the error. Nothing is saved, and no exit 4 is possible, when
 this run signed or settled nothing (a replay of a payment already recorded as settled, or a
 refusal before signing). Library callers: pay() raises PaidUnrecorded for exit 4; it is NOT
@@ -55,7 +59,9 @@ a Refused subclass, so `except Refused` does not catch it. It raises PaidUnknown
 also not a Refused subclass. A Ctrl-C after the record is saved is NOT turned into an
 Exception by pay(): it raises PaidInterrupted, a KeyboardInterrupt subclass whose `payment`
 attribute holds block_hash, ledger, from, to, amount_xno and receipt, so it stops a batch
-loop like any Ctrl-C; only main() prints it as exit 5 "interrupted". Otherwise, for exit 5, a retry that reaches the send and still cannot settle the block
+loop like any Ctrl-C; a Ctrl-C held during a send that then raised PaidUnknown, PaidUnrecorded
+or Refused is raised as PaidInterrupted too, chained to that error. Only main() prints it as
+JSON "interrupted". Otherwise, for exit 5, a retry that reaches the send and still cannot settle the block
 exits 5 again (a refusal before the send, e.g. the price is now over --max-xno, is exit 1:
 this run signed nothing, but the earlier block may still have landed).
 """
@@ -130,13 +136,37 @@ class PaidInterrupted(KeyboardInterrupt):
     `except Exception` does not swallow it and pay the next URL). It carries the payment:
     `payment` (the same dict as `extra`: block_hash, ledger, from, to, amount_xno, receipt),
     `paid` ("unknown"), `reason` ("interrupted") and `message`. Only the CLI main() turns it
-    into exit 5 JSON. A retry with the same ledger is safe: it reuses that same block."""
+    into exit 5 JSON. A retry with the same ledger is safe: it reuses that same block.
 
-    def __init__(self, message, extra=None):
+    It is also raised for a Ctrl-C held during the send when the send itself then ends in an
+    error (PaidUnknown, PaidUnrecorded, Refused, anything): the Ctrl-C is not dropped. Then it
+    is chained (`__cause__`) to that error, `extra` carries that error's details plus
+    `interrupted_error` (its reason), and `paid`/`recorded` are that error's (`recorded` is
+    False, with `unsaved_record`, for a PaidUnrecorded; `paid` is False and `recorded` None for
+    a Refused)."""
+
+    def __init__(self, message, extra=None, paid="unknown", recorded=True):
         super().__init__(message)
         self.reason, self.message, self.extra = "interrupted", message, dict(extra or {})
         self.payment = self.extra
-        self.paid = "unknown"
+        self.paid = paid
+        self.recorded = recorded
+
+
+def _interrupted_during(error):
+    """A Ctrl-C held during a send that then raised `error`: a PaidInterrupted carrying what
+    `error` knows, so the caller stops instead of handling `error` and going on."""
+    reason = getattr(error, "reason", None) or type(error).__name__
+    message = getattr(error, "message", None) or str(error) or type(error).__name__
+    extra = dict(getattr(error, "extra", None) or {}, interrupted_error=reason)
+    if isinstance(error, Refused):
+        paid, recorded = False, None
+    elif isinstance(error, PaidUnrecorded):
+        paid, recorded = error.paid, False
+    else:
+        paid, recorded = getattr(error, "paid", "unknown"), True
+    return PaidInterrupted("interrupted (Ctrl-C) during the send, which then ended in %s: %s"
+                           % (reason, message), extra, paid=paid, recorded=recorded)
 
 
 # Refusals that leave this payment's unsettled record in the ledger yet say for certain what
@@ -153,14 +183,22 @@ class _SigintDeferred:
     unrecorded. Main thread only (signal handlers cannot be set elsewhere); the previous
     handler is always restored. A previous handler of None (one not installed from Python) is
     restored as signal.default_int_handler; a held Ctrl-C under SIG_DFL is re-delivered as a
-    real SIGINT once SIG_DFL is back, so it still ends the process."""
+    real SIGINT once SIG_DFL is back, so it still ends the process.
+
+    A held Ctrl-C is never dropped. If the block is raising an Exception (PaidUnknown,
+    PaidUnrecorded, Refused, anything) when it ends, the Ctrl-C is raised as PaidInterrupted
+    chained to that exception and carrying its details (see _interrupted_during), so a caller
+    that handles that exception still stops; inside another _SigintDeferred it is handed to
+    the outer one, which does the same when it ends. Under SIG_IGN it is ignored as usual."""
+
+    def _hold(self, signum, frame):
+        self.pending.append(signum)
 
     def __enter__(self):
         self.pending, self.previous, self.installed = [], None, False
         if threading.current_thread() is threading.main_thread():
             try:
-                self.previous = signal.signal(signal.SIGINT,
-                                              lambda signum, frame: self.pending.append(signum))
+                self.previous = signal.signal(signal.SIGINT, self._hold)
                 self.installed = True
             except (ValueError, OSError):
                 self.previous = None
@@ -168,17 +206,31 @@ class _SigintDeferred:
             self.previous = signal.default_int_handler
         return self
 
-    def __exit__(self, *exc_info):
-        if self.installed:
-            signal.signal(signal.SIGINT, self.previous)
-            # Delivered only when the block ends normally: if it is already raising (e.g.
-            # PaidUnrecorded) that report must reach the caller, not be replaced.
-            if self.pending and exc_info[0] is None:
-                if self.previous is signal.SIG_DFL:
-                    os.kill(os.getpid(), signal.SIGINT)   # SIG_DFL is back: ends the process
-                elif callable(self.previous):
-                    self.previous(signal.SIGINT, None)    # the default handler raises KeyboardInterrupt
-        return False
+    def __exit__(self, exc_type, exc, tb):
+        if not self.installed:
+            return False
+        signal.signal(signal.SIGINT, self.previous)
+        if not self.pending or self.previous is signal.SIG_IGN:
+            return False
+        outer = isinstance(getattr(self.previous, "__self__", None), _SigintDeferred)
+        if exc_type is None or outer:
+            # Ends normally, or nested: deliver to the previous handler (an outer
+            # _SigintDeferred only holds it, and converts it when it ends).
+            if self.previous is signal.SIG_DFL:
+                os.kill(os.getpid(), signal.SIGINT)   # SIG_DFL is back: ends the process
+            elif callable(self.previous):
+                self.previous(signal.SIGINT, None)    # the default handler raises KeyboardInterrupt
+            return False
+        if not issubclass(exc_type, Exception):
+            return False        # already a KeyboardInterrupt / SystemExit: it stops the caller
+        if self.previous is not signal.SIG_DFL and callable(self.previous):
+            try:
+                self.previous(signal.SIGINT, None)
+            except BaseException:
+                pass            # the handler stops the caller: say so below, with the report
+            else:
+                return False    # a handler that does not raise chose to carry on
+        raise _interrupted_during(exc) from exc
 
 
 # ------------------------------------------------------------------ fetch
@@ -646,19 +698,24 @@ def idempotency_key(url, pay_to, raw):
 
 def wait_confirmed(node, block_hash, seconds=30, sleep=time.sleep):
     """True once the node calls the block confirmed, False when it cannot say in time. Runs
-    after the payment is published and recorded, so no node error may escape it: an escaping
-    exception would exit 1 ("signed no new block") for a payment that went out. A node without
-    block_info cannot say, so it is False at once rather than polled."""
+    after the payment is published and recorded, so no node error may escape it: NodeError, a
+    reply cut off mid-read (nanonode.ReplyCutOff, i.e. http.client.HTTPException), ValueError,
+    OSError and a reply that is not an object all read as "cannot say yet". A node without
+    block_info (NotImplementedError) cannot say, so it is False at once rather than polled. Anything else a custom node client
+    raises (a TypeError, say) is a bug in that client and propagates, as it did before."""
     deadline = time.time() + seconds
     while True:
         try:
-            if (node.block_info(block_hash) or {}).get("confirmed") is True:
+            info = node.block_info(block_hash)
+            if isinstance(info, dict) and info.get("confirmed") is True:
                 return True
         except NotImplementedError:
             return False
-        except Exception:
-            # NodeError, or anything a custom node client raises (a non-dict reply read with
-            # .get, a broken connection): the confirmation is unknown, not the payment.
+        except (nanonode.NodeError, nanonode.ReplyCutOff, ValueError, OSError):
+            # A node error, a reply cut off mid-read, an unparsable reply, a broken connection:
+            # the confirmation is unknown, not the payment. A reply that is not an object
+            # (checked above) reads the same. Any other exception (a TypeError in a custom node
+            # client, say) is a bug in that client and is raised.
             pass
         if time.time() >= deadline:
             return False
@@ -892,6 +949,25 @@ def _opt(args, name, default=None):
     return default
 
 
+def _die_by_sigint(fallback):
+    """End the process by SIGINT once a Ctrl-C has been reported: a shell (a bash `for` loop)
+    stops only when its child died by SIGINT, not when it exited with some code. Output is
+    flushed first. Where SIGINT cannot be delivered to this process (not POSIX, e.g. Windows,
+    or not the main thread, or SIGINT blocked), `fallback` is returned as the exit code."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGINT)
+        except (AttributeError, OSError, ValueError):
+            pass
+    return fallback
+
+
 def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
     args = list(sys.argv[1:] if argv is None else argv)
     out = lambda obj: print(json.dumps(obj, indent=2, sort_keys=True))  # noqa: E731
@@ -951,9 +1027,22 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
         out(dict(exc.extra, paid="unknown", recorded=True, error=exc.reason, message=exc.message))
         return 5
     except PaidInterrupted as exc:
-        # The CLI alone turns a Ctrl-C after the save into exit 5 JSON; pay() raises it.
-        out(dict(exc.extra, paid="unknown", recorded=True, error=exc.reason, message=exc.message))
-        return 5
+        # The CLI alone turns a Ctrl-C after the save into JSON; pay() raises it. Then it dies
+        # by SIGINT, as an uncaught Ctrl-C would, so a shell loop running it stops too.
+        report = dict(exc.extra, paid=exc.paid, error=exc.reason, message=exc.message)
+        if exc.recorded is not None:
+            report["recorded"] = exc.recorded
+        cause = exc.__cause__
+        if isinstance(cause, Refused):
+            report["refused"] = cause.reason
+        out(report)
+        if isinstance(cause, PaidUnrecorded):
+            fallback = 4
+        elif isinstance(cause, Refused):
+            fallback = 2 if cause.reason == "usage" else 1
+        else:
+            fallback = 5
+        return _die_by_sigint(fallback)
     except Refused as exc:
         out(dict(exc.extra, paid=False, refused=exc.reason, message=exc.message))
         return 2 if exc.reason == "usage" else 1

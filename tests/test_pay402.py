@@ -8,8 +8,10 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -67,8 +69,12 @@ class Seller:
 
 
 def run(argv, fetcher, node=None):
+    """main() in this process. After reporting a Ctrl-C, main() ends the process by SIGINT;
+    here that last step returns its fallback exit code instead (CliCtrlCStopsAShellLoop runs
+    the real CLI in a subprocess and checks the death)."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stdout(buf), \
+            mock.patch.object(pay402, "_die_by_sigint", side_effect=lambda code: code):
         code = pay402.main(argv, fetcher=fetcher, node=node, sleep=lambda s: None)
     return code, json.loads(buf.getvalue())
 
@@ -1552,6 +1558,218 @@ class ExitOneMeansNoNewBlock(Funded):
         self.assertIn("Only the CLI's `main()` turns it into exit 5.", readme)
         self.assertNotIn("(`pay402.PaidUnknown` from Python): Ctrl-C", readme)
         self.assertIn("PaidInterrupted, a KeyboardInterrupt subclass", pay402.__doc__)
+
+
+class HeldCtrlCIsNeverDropped(Funded):
+    """A Ctrl-C held during the send is not dropped when the send then ends in an exception:
+    it is raised as PaidInterrupted chained to that exception, so the README batch loop stops."""
+
+    def _sigint_then(self, error):
+        real = self.node.process
+        calls = {"n": 0}
+
+        def process(block):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                os.kill(os.getpid(), signal.SIGINT)   # Ctrl-C while the node hangs
+                real(block)
+                raise error
+            return real(block)
+        return mock.patch.object(self.node, "process", side_effect=process)
+
+    def _readme_loop(self):
+        handled = []
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            for url in (URL, URL + "/second"):
+                summary, entry_ = pay402.plan(url, challenge(entry())["accepts"], "0.1")
+                try:
+                    pay402.pay(url, entry_, summary, self.key_file, "0.1", self.node,
+                               fetcher=Seller(challenge(entry())), sleep=lambda s: None,
+                               confirm_seconds=0)
+                    handled.append((url, "ok"))
+                except (pay402.Refused, pay402.PaidUnknown, pay402.PaidUnrecorded) as exc:
+                    handled.append((url, type(exc).__name__))
+        self.assertEqual(handled, [], "the README handler swallowed the Ctrl-C")
+        self.assertEqual(len(self.sends()), 1, "the batch went on to pay the next URL")
+        self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+        return caught.exception
+
+    def test_ctrl_c_during_a_send_that_times_out_stops_the_readme_python_loop(self):
+        with self._sigint_then(fakenode.nanonode.NodeError("timeout", "no reply")):
+            exc = self._readme_loop()
+        self.assertIsInstance(exc, pay402.PaidInterrupted)
+        self.assertIsInstance(exc.__cause__, pay402.PaidUnknown)
+        self.assertEqual((exc.paid, exc.recorded, exc.extra["interrupted_error"]),
+                         ("unknown", True, "timeout"))
+        block_hash = _hash(self.sends()[0])
+        self.assertEqual(exc.payment["block_hash"], block_hash)
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        with open(self.key_file + ".pay402-sent.json") as handle:
+            self.assertEqual(json.load(handle)[key]["block_hash"], block_hash)
+
+    def test_ctrl_c_during_a_send_whose_save_fails_stops_the_loop_and_keeps_the_record(self):
+        with self._sigint_then(fakenode.nanonode.NodeError("timeout", "no reply")), \
+                mock.patch.object(pay402.os, "replace", side_effect=OSError(28, "No space")):
+            exc = self._readme_loop()
+        self.assertIsInstance(exc.__cause__, pay402.PaidUnrecorded)
+        self.assertEqual((exc.paid, exc.recorded), ("unknown", False))
+        key = pay402.idempotency_key(URL, SELLER, PRICE)
+        self.assertEqual(exc.extra["unsaved_record"][key]["block_hash"], _hash(self.sends()[0]))
+
+    def test_cli_reports_the_ctrl_c_and_the_send_error_together(self):
+        with self._sigint_then(fakenode.nanonode.NodeError("timeout", "no reply")):
+            code, out = run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                            Seller(challenge(entry())), self.node)
+        self.assertEqual((code, out["paid"], out["recorded"], out["error"],
+                          out["interrupted_error"]),
+                         (5, "unknown", True, "interrupted", "timeout"), out)
+        self.assertEqual(out["block_hash"], _hash(self.sends()[0]))
+
+    def test_ctrl_c_during_a_send_that_is_refused_is_raised_not_dropped(self):
+        def send(*args, **kwargs):
+            os.kill(os.getpid(), signal.SIGINT)
+            raise payments.ToolError("insufficient_balance", "not enough XNO")
+        summary, entry_ = pay402.plan(URL, challenge(entry())["accepts"], "0.1")
+        with mock.patch.object(pay402.payments, "send", side_effect=send):
+            with self.assertRaises(pay402.PaidInterrupted) as caught:
+                pay402.pay(URL, entry_, summary, self.key_file, "0.1", self.node,
+                           fetcher=Seller(challenge(entry())), sleep=lambda s: None)
+        exc = caught.exception
+        self.assertIsInstance(exc.__cause__, pay402.Refused)
+        self.assertEqual((exc.paid, exc.extra["interrupted_error"]),
+                         (False, "insufficient_balance"))
+        self.assertEqual(len(self.sends()), 0)
+
+
+class WaitConfirmedRaisesClientBugs(unittest.TestCase):
+    """wait_confirmed reads node and read failures as "cannot say yet", not a custom node's bug."""
+
+    class Node:
+        def __init__(self, error):
+            self.error = error
+
+        def block_info(self, block_hash):
+            raise self.error
+
+    def test_a_type_error_from_a_custom_node_propagates(self):
+        with self.assertRaises(TypeError):
+            pay402.wait_confirmed(self.Node(TypeError("bug in the client")), "AB", 0,
+                                  sleep=lambda s: None)
+
+    def test_node_and_read_failures_read_as_not_confirmed(self):
+        import http.client
+        for error in (fakenode.nanonode.NodeError("timeout", "no reply"),
+                      http.client.IncompleteRead(b""), ValueError("bad json"),
+                      OSError("reset")):
+            self.assertFalse(pay402.wait_confirmed(self.Node(error), "AB", 0,
+                                                   sleep=lambda s: None), error)
+
+
+_HARNESS = r'''
+import os, signal, sys, tempfile
+REPO, URL, SENDLOG, MODE = sys.argv[1:5]
+sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "tests"))
+import fakenode, keystore, payments, pay402
+import test_pay402 as t
+
+node = fakenode.FakeNode()
+keys = keystore.KeyStore()
+key_file = os.path.join(tempfile.mkdtemp(), "key")
+payer = payments.create_address(store="file", path=key_file, keys=keys)["address"]
+node.fund(payer, 10 * t.RAW)
+payments.receive(payer, node, keys)
+real = node.process
+link = t.nanoaddr.decode(t.SELLER).hex().upper()
+first = URL.endswith("/first")
+
+
+def process(block):
+    if block.get("link") != link:
+        return real(block)
+    with open(SENDLOG, "a") as fh:
+        fh.write(URL + "\n")
+    if first and MODE == "timeout":
+        os.killpg(0, signal.SIGINT)     # Ctrl-C at the terminal while the node hangs
+        real(block)
+        raise fakenode.nanonode.NodeError("timeout", "no reply")
+    return real(block)
+
+
+node.process = process
+seller = t.Seller(t.challenge(t.entry()))
+
+
+def fetcher(url, method="GET", data=None, headers=None, timeout=20):
+    if first and MODE == "seller" and "X-PAYMENT" in (headers or {}):
+        os.killpg(0, signal.SIGINT)     # Ctrl-C at the terminal: the whole foreground group
+    return seller(url, method, data, headers, timeout)
+
+
+sys.exit(pay402.main([URL, "--pay", "--key-file", key_file, "--max-xno", "0.1"],
+                     fetcher=fetcher, node=node, sleep=lambda s: None))
+'''
+
+_LOOP = r'''
+python="$1"; harness="$2"; repo="$3"; log="$4"; mode="$5"; outdir="$6"
+for u in https://seller.example/api/first https://seller.example/api/second; do
+  "$python" "$harness" "$repo" "$u" "$log" "$mode" > "$outdir/${u##*/}.json" 2> "$outdir/${u##*/}.err"
+  echo "url=$u rc=$?"
+done
+echo "loop finished"
+'''
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "needs POSIX and bash")
+class CliCtrlCStopsAShellLoop(unittest.TestCase):
+    """A two-URL bash `for` loop over the CLI (fake node), Ctrl-C to the whole process group
+    during URL 1: the CLI prints its JSON and dies by SIGINT, so bash stops the loop and URL 2
+    is never paid. bash goes on to the next URL when the child merely exits 5."""
+
+    def _loop(self, mode):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        harness = os.path.join(tmp.name, "harness.py")
+        with open(harness, "w") as handle:
+            handle.write(_HARNESS)
+        log = os.path.join(tmp.name, "sends.log")
+        open(log, "w").close()
+        proc = subprocess.run(["bash", "-c", _LOOP, "loop", sys.executable, harness, ROOT, log,
+                               mode, tmp.name],
+                              capture_output=True, text=True, timeout=120,
+                              start_new_session=True)
+        with open(log) as handle:
+            sends = handle.read().split()
+        with open(os.path.join(tmp.name, "first.json")) as handle:
+            first = json.load(handle)
+        return proc, sends, first
+
+    def _assert_stopped(self, proc, sends, first):
+        self.assertEqual(sends, ["https://seller.example/api/first"],
+                         "the loop went on to pay the next URL: %s" % proc.stdout)
+        self.assertNotIn("second", proc.stdout)
+        self.assertNotIn("loop finished", proc.stdout)
+        self.assertEqual(proc.returncode, -signal.SIGINT, (proc.stdout, proc.stderr))
+        self.assertEqual((first["paid"], first["error"]), ("unknown", "interrupted"), first)
+
+    def test_readme_states_the_shell_and_python_loop_contracts(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+            readme = " ".join(handle.read().split())
+        self.assertIn("ends itself by SIGINT, as an uncaught Ctrl-C does, so the shell sees "
+                      "status 130", readme)
+        self.assertIn("loop stops there and does not go on to pay the next URL", readme)
+        self.assertIn("the Ctrl-C is not dropped, so the loop below stops", readme)
+        self.assertNotIn("CLI exits 5 with `\"error\": \"interrupted\"`", readme)
+
+    def test_ctrl_c_during_the_seller_call_stops_the_shell_loop(self):
+        proc, sends, first = self._loop("seller")
+        self._assert_stopped(proc, sends, first)
+        self.assertIn("during the seller call", first["message"])
+
+    def test_ctrl_c_during_a_send_that_times_out_stops_the_shell_loop(self):
+        proc, sends, first = self._loop("timeout")
+        self._assert_stopped(proc, sends, first)
+        self.assertEqual((first["recorded"], first["interrupted_error"]), (True, "timeout"))
 
 
 class HardLinkedFilesAreRefused(Funded):

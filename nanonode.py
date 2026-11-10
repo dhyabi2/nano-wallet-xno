@@ -27,6 +27,10 @@ DEFAULT_TIMEOUT = 10.0
 # User-Agent with 403 "error code: 1010", which reads exactly like a refused key.
 USER_AGENT = "nano-wallet-xno/1.1"
 
+# A reply cut off mid-read (IncompleteRead, a bad status line). Not an OSError; named here so
+# callers that must not import the network stack themselves (pay402) can catch it.
+ReplyCutOff = http.client.HTTPException
+
 
 class NodeError(Exception):
     """A node was unreachable, or answered something unusable.
