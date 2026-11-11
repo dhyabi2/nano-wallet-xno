@@ -308,7 +308,14 @@ def plan(url, accepts, max_xno=None):
         raise Refused("bad_pay_to", "payTo %r fails its checksum (%s): paying it would lose the money"
                       % (pay_to, verdict.get("reason")))
     raw = entry_amount_raw(entry)
-    binding = (entry.get("extra") or {}).get("binding")
+    extra = entry.get("extra")
+    if extra and not isinstance(extra, dict):
+        # payment_header() reads the binding out of `extra` only after the block is published:
+        # an `extra` that is not an object is refused here, before anything is signed. An
+        # empty one (null, "", {}) is read as "no extra", as before.
+        raise Refused("bad_extra", "the nano entry's extra %r is not a JSON object: not paying"
+                      % (extra,))
+    binding = (extra or {}).get("binding")
     out = {"url": url, "network": entry["network"], "asset": entry.get("asset"),
            "pay_to": verdict["normalised"], "amount_raw": str(raw),
            "amount_xno": wallet.raw_to_xno(raw), "binding": None}
@@ -329,6 +336,27 @@ def plan(url, accepts, max_xno=None):
             raise Refused("binding_nonce_invalid",
                           "the seller's binding nonce %r is not a non-empty string: not paying"
                           % (nonce,))
+        # Every field the payment header signs must encode as UTF-8 (a lone surrogate such as
+        # "\ud800" does not), and the binding message itself is built here with a placeholder
+        # block hash: a failure there after the send would leave the seller paid and uncalled.
+        try:
+            nonce.encode("utf-8")
+        except UnicodeEncodeError:
+            raise Refused("binding_nonce_invalid",
+                          "the seller's binding nonce %r is not valid UTF-8 text: not paying"
+                          % (nonce,)) from None
+        try:
+            binding["resource"].encode("utf-8")
+        except UnicodeEncodeError:
+            raise Refused("binding_resource_mismatch",
+                          "the binding resource %r is not valid UTF-8 text, so it cannot be "
+                          "signed: not paying" % (binding["resource"],)) from None
+        try:
+            binding_message("00" * 32, nonce, binding["resource"], entry["payTo"])
+        except Exception as exc:
+            raise Refused("binding_nonce_invalid",
+                          "cannot build the payment header for this binding (%s: %s): not paying"
+                          % (type(exc).__name__, exc)) from None
         out["binding"] = BINDING_SCHEME
     if max_xno is not None:
         try:
@@ -1004,6 +1032,22 @@ def _die_by_sigint(fallback):
     return fallback
 
 
+def _report(out, obj):
+    """Print a report after a block was signed, flushed now so a closed stdout shows up here.
+    If the reader is gone (BrokenPipeError, e.g. `| head -0`) the report is lost but the run
+    goes on to its exit code: stdout is pointed at os.devnull so the interpreter's own flush
+    at exit does not fail again (Python's documented recipe for SIGPIPE)."""
+    try:
+        out(obj)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except (AttributeError, OSError, ValueError):
+            pass            # not a real file (a StringIO, say): nothing is left to flush
+
+
 def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
     args = list(sys.argv[1:] if argv is None else argv)
     out = lambda obj: print(json.dumps(obj, indent=2, sort_keys=True))  # noqa: E731
@@ -1051,16 +1095,26 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
                           "mode 600; make one with `python3 nano_keygen.py new --key-file FILE`)")
         node = node or nanonode.HttpNanoNode(node_url)
         result = pay(url, entry, summary, key_file, max_xno, node, method, body, ledger, fetcher, sleep)
-        if "pin" in summary:
-            result["pin"] = summary["pin"]
-        out(result)
         status = result["seller_status"]
-        return 0 if status is not None and 200 <= status < 300 else 3
+        code = 0 if status is not None and 200 <= status < 300 else 3
+        try:
+            # The block is signed: from here nothing may end as exit 1 (a traceback). A
+            # Ctrl-C is held until the report is out, then ends the run by SIGINT; a closed
+            # stdout (`| head -0`) loses the report but not the exit code.
+            with _SigintDeferred():
+                if "pin" in summary:
+                    result["pin"] = summary["pin"]
+                _report(out, result)
+        except KeyboardInterrupt:
+            return _die_by_sigint(code)
+        return code
     except PaidUnrecorded as exc:
-        out(dict(exc.extra, paid=exc.paid, recorded=False, error=exc.reason, message=exc.message))
+        _report(out, dict(exc.extra, paid=exc.paid, recorded=False, error=exc.reason,
+                          message=exc.message))
         return 4
     except PaidUnknown as exc:
-        out(dict(exc.extra, paid="unknown", recorded=True, error=exc.reason, message=exc.message))
+        _report(out, dict(exc.extra, paid="unknown", recorded=True, error=exc.reason,
+                          message=exc.message))
         return 5
     except PaidInterrupted as exc:
         # The CLI alone turns a Ctrl-C after the save into JSON; pay() raises it. Then it dies

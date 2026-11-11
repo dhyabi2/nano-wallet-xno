@@ -1928,5 +1928,122 @@ class NothingAfterTheSendEndsAsExitOne(Funded):
         self.assertEqual(out["block_hash"], _hash(self.node.published[-1]))
 
 
+class _BrokenPipe(io.StringIO):
+    """stdout of `pay402 ... | head -0`: the reader is gone."""
+
+    def write(self, text):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def _json_hook(on_report):
+    """A stand-in for pay402.json whose dumps() calls on_report() for the final paid report."""
+    real_json = json
+
+    class Json:
+        fired = []
+
+        def __getattr__(self, name):
+            return getattr(real_json, name)
+
+        def dumps(self, obj, *args, **kwargs):
+            if isinstance(obj, dict) and obj.get("paid") is True and not self.fired:
+                self.fired.append(True)
+                on_report()
+            return real_json.dumps(obj, *args, **kwargs)
+    return Json()
+
+
+class NoExitOneOnceTheBlockIsSigned(Funded):
+    """README: "Exit 1 always means this run signed no new block". Fields that go into the
+    binding message are checked before signing; the final report cannot turn a payment into a
+    traceback (exit 1)."""
+
+    ARGS = ["--pay", "--max-xno", "0.1"]
+
+    def pay(self, seller, url=URL):
+        return run([url] + self.ARGS + ["--key-file", self.key_file], seller, self.node)
+
+    def test_a_nonce_that_is_not_utf8_encodable_is_refused_before_signing(self):
+        for nonce in ("\ud800", "ok\udfffok", "\udc80"):
+            seller = Seller(challenge(entry(extra=_binding(nonce=nonce))))
+            code, out = self.pay(seller)
+            self.assertEqual((code, out["paid"], out["refused"]),
+                             (1, False, "binding_nonce_invalid"), (nonce, out))
+            self.assertEqual(len(seller.requests), 1, "the seller was paid-called")
+            code, out = run([URL], Seller(challenge(entry(extra=_binding(nonce=nonce)))))
+            self.assertEqual((code, out["refused"]), (1, "binding_nonce_invalid"), nonce)
+        self.assertEqual(self.sends(), [])
+
+    def test_a_resource_that_is_not_utf8_encodable_is_refused_before_signing(self):
+        doc = challenge(entry(extra=_binding(resource="/api/audit\udcff")))
+        code, out = self.pay(Seller(doc), url=URL + "\udcff")
+        self.assertEqual((code, out["paid"], out["refused"]),
+                         (1, False, "binding_resource_mismatch"), out)
+        self.assertEqual(self.sends(), [])
+
+    def test_an_extra_that_is_not_an_object_is_refused_before_signing(self):
+        for extra in ("x", 7, ["binding"], True):
+            code, out = self.pay(Seller(challenge(entry(extra=extra))))
+            self.assertEqual((code, out["paid"], out["refused"]), (1, False, "bad_extra"),
+                             (extra, out))
+            code, out = run([URL], Seller(challenge(entry(extra=extra))))
+            self.assertEqual((code, out["refused"]), (1, "bad_extra"), extra)
+        self.assertEqual(self.sends(), [])
+        for extra in (None, {}, ""):        # what main paid without a binding still pays
+            code, out = run([URL], Seller(challenge(entry(extra=extra))))
+            self.assertEqual(code, 0, (extra, out))
+
+    def _main(self, seller, stdout, url=URL):
+        with contextlib.redirect_stdout(stdout), \
+                mock.patch.object(pay402, "_die_by_sigint", side_effect=lambda code: code) as die:
+            code = pay402.main([url] + self.ARGS + ["--key-file", self.key_file], fetcher=seller,
+                               node=self.node, sleep=lambda s: None)
+        return code, die
+
+    def test_a_broken_pipe_on_the_final_report_exits_with_the_paid_code(self):
+        for n, (answer, wanted) in enumerate((((200, b'{"ok": true}'), 0), ((500, b"no"), 3))):
+            try:
+                code, die = self._main(Seller(challenge(entry()), answer=answer), _BrokenPipe(),
+                                       url=URL + "?n=%d" % n)
+            except BrokenPipeError:
+                self.fail("a broken pipe after paying escaped main() (exit 1)")
+            self.assertEqual(code, wanted)
+            die.assert_not_called()
+            self.assertEqual(len(self.sends()), n + 1)
+
+    def test_ctrl_c_while_the_final_report_prints_reports_the_payment(self):
+        buf = io.StringIO()
+        hook = _json_hook(lambda: os.kill(os.getpid(), signal.SIGINT))
+        with mock.patch.object(pay402, "json", hook):
+            try:
+                code, die = self._main(Seller(challenge(entry())), buf)
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C after paying escaped main() as a bare KeyboardInterrupt")
+        self.assertTrue(hook.fired)
+        die.assert_called_once_with(0)
+        self.assertEqual(code, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual((out["paid"], out["seller_status"]), (True, 200), out)
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_ctrl_c_raised_inside_the_final_print_is_not_a_bare_traceback(self):
+        def boom():
+            raise KeyboardInterrupt
+        hook = _json_hook(boom)
+        with mock.patch.object(pay402, "json", hook):
+            try:
+                code, die = self._main(Seller(challenge(entry()), answer=(500, b"no")),
+                                       io.StringIO())
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C after paying escaped main() as a bare KeyboardInterrupt")
+        self.assertTrue(hook.fired)
+        die.assert_called_once_with(3)
+        self.assertEqual(code, 3)
+        self.assertEqual(len(self.sends()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
