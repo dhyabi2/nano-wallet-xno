@@ -1693,6 +1693,9 @@ def process(block):
         os.killpg(0, signal.SIGINT)     # Ctrl-C at the terminal while the node hangs
         real(block)
         raise fakenode.nanonode.NodeError("timeout", "no reply")
+    if MODE == "lost":                  # the block lands, its reply is lost: exit 5
+        real(block)
+        raise fakenode.nanonode.NodeError("timeout", "no reply")
     return real(block)
 
 
@@ -1938,8 +1941,19 @@ class _BrokenPipe(io.StringIO):
         raise BrokenPipeError(32, "Broken pipe")
 
 
-def _json_hook(on_report):
-    """A stand-in for pay402.json whose dumps() calls on_report() for the final paid report."""
+class _NoSpace(io.StringIO):
+    """stdout of `pay402 ... > /dev/full`: every write fails with ENOSPC."""
+
+    def write(self, text):
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        raise OSError(28, "No space left on device")
+
+
+def _json_hook(on_report, paid=True):
+    """A stand-in for pay402.json whose dumps() calls on_report() for the final paid report
+    (the first report whose "paid" is `paid`)."""
     real_json = json
 
     class Json:
@@ -1949,7 +1963,7 @@ def _json_hook(on_report):
             return getattr(real_json, name)
 
         def dumps(self, obj, *args, **kwargs):
-            if isinstance(obj, dict) and obj.get("paid") is True and not self.fired:
+            if isinstance(obj, dict) and obj.get("paid") == paid and not self.fired:
                 self.fired.append(True)
                 on_report()
             return real_json.dumps(obj, *args, **kwargs)
@@ -2043,6 +2057,120 @@ class NoExitOneOnceTheBlockIsSigned(Funded):
         die.assert_called_once_with(3)
         self.assertEqual(code, 3)
         self.assertEqual(len(self.sends()), 1)
+
+    def _ending(self, wanted):
+        """Patches that make the paid run end in exit `wanted` (0, 3, 4 or 5)."""
+        stack = contextlib.ExitStack()
+        if wanted in (4, 5):
+            real = self.node.process
+
+            def process(block):
+                real(block)
+                raise fakenode.nanonode.NodeError("timeout", "no reply")
+            stack.enter_context(mock.patch.object(self.node, "process", side_effect=process))
+        if wanted == 4:
+            stack.enter_context(mock.patch.object(pay402.os, "replace",
+                                                  side_effect=OSError(28, "No space")))
+        answer = (500, b"no") if wanted == 3 else (200, b'{"ok": true}')
+        return stack, Seller(challenge(entry()), answer=answer)
+
+    def test_a_full_stdout_after_paying_exits_with_the_paid_code(self):
+        for n, wanted in enumerate((0, 3, 4, 5)):
+            stack, seller = self._ending(wanted)
+            with stack:
+                try:
+                    code, die = self._main(seller, _NoSpace(), url=URL + "?n=%d" % n)
+                except OSError:
+                    self.fail("ENOSPC on stdout after paying escaped main() (exit 1)")
+            self.assertEqual(code, wanted)
+            die.assert_not_called()
+            self.assertEqual(len(self.sends()), n + 1)
+
+    def test_ctrl_c_while_the_exit_4_or_5_report_prints_is_held(self):
+        for n, (wanted, paid) in enumerate(((4, "unknown"), (5, "unknown"))):
+            buf = io.StringIO()
+            hook = _json_hook(lambda: os.kill(os.getpid(), signal.SIGINT), paid=paid)
+            stack, seller = self._ending(wanted)
+            with stack, mock.patch.object(pay402, "json", hook):
+                try:
+                    code, die = self._main(seller, buf, url=URL + "?n=%d" % n)
+                except KeyboardInterrupt:
+                    self.fail("Ctrl-C during the exit %d report escaped main()" % wanted)
+            self.assertTrue(hook.fired)
+            die.assert_called_once_with(wanted)
+            self.assertEqual(code, wanted)
+            out = json.loads(buf.getvalue())
+            self.assertEqual((out["paid"], out["recorded"]), (paid, wanted == 5), out)
+            self.assertEqual(out["block_hash"], _hash(self.node.published[-1]))
+            self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    def test_ctrl_c_just_after_pay_returns_still_reports_the_payment(self):
+        real_pay = pay402.pay
+
+        class Result(dict):
+            hit = []
+
+            def __getitem__(self, name):
+                if name == "seller_status" and not self.hit:
+                    self.hit.append(True)
+                    raise KeyboardInterrupt     # Ctrl-C on main()'s first step after pay()
+                return dict.__getitem__(self, name)
+
+        def pay(*args, **kwargs):
+            return Result(real_pay(*args, **kwargs))
+        buf = io.StringIO()
+        with mock.patch.object(pay402, "pay", pay):
+            try:
+                code, die = self._main(Seller(challenge(entry())), buf)
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C just after pay() returned escaped main()")
+        self.assertTrue(Result.hit)
+        die.assert_called_once_with(0)
+        self.assertEqual(code, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual((out["paid"], out["seller_status"]), (True, 200), out)
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_ctrl_c_after_paying_with_stdout_closed_ends_by_sigint_not_exit_1(self):
+        for n, stdout in enumerate((_BrokenPipe(), _NoSpace())):
+            with mock.patch.object(pay402, "payment_header", side_effect=KeyboardInterrupt()):
+                try:
+                    code, die = self._main(Seller(challenge(entry())), stdout,
+                                           url=URL + "?n=%d" % n)
+                except OSError:
+                    self.fail("a closed stdout after a paid Ctrl-C escaped main() (exit 1)")
+            die.assert_called_once_with(5)
+            self.assertEqual(code, 5)
+            self.assertEqual(len(self.sends()), n + 1)
+
+
+@unittest.skipUnless(os.name == "posix" and os.path.exists("/dev/full"), "needs /dev/full")
+class CliStdoutOnDevFull(unittest.TestCase):
+    """The real CLI (fake node) with stdout on /dev/full: every write fails with ENOSPC. Once a
+    block was sent the exit code is still the paid one (0, or 5 for a lost node reply), never
+    1 with a traceback."""
+
+    def _run(self, mode):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        harness = os.path.join(tmp.name, "harness.py")
+        with open(harness, "w") as handle:
+            handle.write(_HARNESS)
+        log = os.path.join(tmp.name, "sends.log")
+        open(log, "w").close()
+        with open("/dev/full", "w") as full:
+            proc = subprocess.run([sys.executable, harness, ROOT, URL, log, mode], stdout=full,
+                                  stderr=subprocess.PIPE, text=True, timeout=120)
+        with open(log) as handle:
+            sends = handle.read().split()
+        return proc, sends
+
+    def test_paid_runs_keep_their_exit_code(self):
+        for mode, wanted in (("ok", 0), ("lost", 5)):
+            proc, sends = self._run(mode)
+            self.assertEqual(proc.returncode, wanted, (mode, proc.stderr))
+            self.assertNotIn("Traceback", proc.stderr, mode)
+            self.assertEqual(sends, [URL], mode)
 
 
 if __name__ == "__main__":

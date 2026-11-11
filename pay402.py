@@ -36,7 +36,9 @@ Exit codes: 0 ok, 1 refused before paying, 2 usage, 3 paid but the seller did no
 5 possibly paid and recorded: the block was handed to the node and its outcome is unknown (a
 timeout, a lost reply, an unexpected error), the attempt IS in the sent ledger, and a retry
 with the same ledger is safe (it settles that same block, it never pays twice). Exit 3 also
-covers a seller that could not be reached after paying ("seller_status": null).
+covers a seller that could not be reached after paying, or any other failure once the record
+is saved ("seller_status": null plus "seller_error"; "confirmed": false when it was a bug in
+the node client's block_info).
 
 On exit 4 the JSON carries "paid": true when the block was published, or "paid": "unknown"
 when the node's reply never arrived so publication itself is uncertain, plus "recorded": false,
@@ -1034,18 +1036,39 @@ def _die_by_sigint(fallback):
 
 def _report(out, obj):
     """Print a report after a block was signed, flushed now so a closed stdout shows up here.
-    If the reader is gone (BrokenPipeError, e.g. `| head -0`) the report is lost but the run
-    goes on to its exit code: stdout is pointed at os.devnull so the interpreter's own flush
-    at exit does not fail again (Python's documented recipe for SIGPIPE)."""
+    If stdout cannot take it (BrokenPipeError when the reader is gone, e.g. `| head -0`, or any
+    other OSError, e.g. ENOSPC on `> /dev/full`) the report is lost but the run goes on to its
+    exit code: stdout is pointed at os.devnull so the interpreter's own flush at exit does not
+    fail again (Python's documented recipe for SIGPIPE)."""
     try:
         out(obj)
         sys.stdout.flush()
-    except BrokenPipeError:
+    except OSError:
         try:
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, sys.stdout.fileno())
         except (AttributeError, OSError, ValueError):
             pass            # not a real file (a StringIO, say): nothing is left to flush
+
+
+def _report_held(out, obj, code, interrupted=False, shown=None):
+    """Print the report of a run that signed a block (exit 0, 3, 4 or 5) with Ctrl-C held, so a
+    Ctrl-C cannot cut it short, and a stdout that cannot take it does not change the exit code
+    (see _report). `obj` may be a callable that builds the report, so building it is held
+    too. If a Ctrl-C was held while it printed, or `interrupted` says one already landed, the
+    run then ends by SIGINT (see _die_by_sigint), `code` being the fallback; else it is
+    returned. `shown` (a list) gets an entry once the report is printed (or lost), so a caller
+    that catches a Ctrl-C does not print it twice."""
+    try:
+        with _SigintDeferred():
+            _report(out, obj() if callable(obj) else obj)
+            if shown is not None:
+                shown.append(True)
+    except KeyboardInterrupt:
+        interrupted = True
+        if shown is not None and not shown:
+            shown.append(True)      # cut short inside out() itself: do not print it again
+    return _die_by_sigint(code) if interrupted else code
 
 
 def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
@@ -1094,52 +1117,73 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
             raise Refused("key_required", "paying requires --key-file (a file holding your 64-hex private key, "
                           "mode 600; make one with `python3 nano_keygen.py new --key-file FILE`)")
         node = node or nanonode.HttpNanoNode(node_url)
-        result = pay(url, entry, summary, key_file, max_xno, node, method, body, ledger, fetcher, sleep)
-        status = result["seller_status"]
-        code = 0 if status is not None and 200 <= status < 300 else 3
+        result = None
+        interrupted = False
+        # The block is signed once pay() returns: from there nothing may end as exit 1 (a
+        # traceback). A Ctrl-C is held until the report is out, then ends the run by SIGINT;
+        # a stdout that cannot take the report (`| head -0`, `> /dev/full`) loses it but not
+        # the exit code.
         try:
-            # The block is signed: from here nothing may end as exit 1 (a traceback). A
-            # Ctrl-C is held until the report is out, then ends the run by SIGINT; a closed
-            # stdout (`| head -0`) loses the report but not the exit code.
-            with _SigintDeferred():
-                if "pin" in summary:
-                    result["pin"] = summary["pin"]
-                _report(out, result)
+            result = pay(url, entry, summary, key_file, max_xno, node, method, body, ledger,
+                         fetcher, sleep)
+            code = _paid_code(result, summary)
         except KeyboardInterrupt:
-            return _die_by_sigint(code)
-        return code
+            if result is None:
+                raise       # inside pay(): PaidInterrupted (below) or nothing signed yet
+            interrupted = True  # a Ctrl-C once pay() returned: report first, then SIGINT
+            code = _paid_code(result, summary)
+        report = result
     except PaidUnrecorded as exc:
-        _report(out, dict(exc.extra, paid=exc.paid, recorded=False, error=exc.reason,
-                          message=exc.message))
-        return 4
+        report, code, interrupted = (lambda e=exc: dict(e.extra, paid=e.paid, recorded=False,
+                                                        error=e.reason, message=e.message)), 4, False
     except PaidUnknown as exc:
-        _report(out, dict(exc.extra, paid="unknown", recorded=True, error=exc.reason,
-                          message=exc.message))
-        return 5
+        report, code, interrupted = (lambda e=exc: dict(e.extra, paid="unknown", recorded=True,
+                                                        error=e.reason, message=e.message)), 5, False
     except PaidInterrupted as exc:
         # The CLI alone turns a Ctrl-C after the save into JSON; pay() raises it. Then it dies
         # by SIGINT, as an uncaught Ctrl-C would, so a shell loop running it stops too.
-        report = dict(exc.extra, paid=exc.paid, error=exc.reason, message=exc.message)
-        if exc.recorded is not None:
-            report["recorded"] = exc.recorded
         cause = exc.__cause__
-        if isinstance(cause, Refused):
-            report["refused"] = cause.reason
-        try:
-            with _SigintDeferred():     # a second Ctrl-C must not cut the report short
-                out(report)
-        except KeyboardInterrupt:
-            pass                        # it is reported: end by SIGINT below, as for the first
         if isinstance(cause, PaidUnrecorded):
             fallback = 4
         elif isinstance(cause, Refused):
             fallback = 2 if cause.reason == "usage" else 1
         else:
             fallback = 5
-        return _die_by_sigint(fallback)
+        report, code, interrupted = (lambda e=exc: _interrupted_report(e)), fallback, True
     except Refused as exc:
         out(dict(exc.extra, paid=False, refused=exc.reason, message=exc.message))
         return 2 if exc.reason == "usage" else 1
+    # Every run that signed a block (exit 0, 3, 4, 5, or Ctrl-C after paying) reports here,
+    # with Ctrl-C held (a second Ctrl-C must not cut the report short) and a stdout that
+    # cannot take the report not changing the exit code. A Ctrl-C that lands in the few
+    # steps before the hold begins is caught here and reported the same way.
+    shown = []
+    try:
+        return _report_held(out, report, code, interrupted, shown)
+    except KeyboardInterrupt:
+        pass
+    if shown:
+        return _die_by_sigint(code)
+    return _report_held(out, report, code, True, shown)
+
+
+def _paid_code(result, summary):
+    """The exit code of a run whose pay() returned (0: the seller accepted it, else 3); the
+    pin read before paying, if any, is added to the report."""
+    if "pin" in summary:
+        result["pin"] = summary["pin"]
+    status = result["seller_status"]
+    return 0 if status is not None and 200 <= status < 300 else 3
+
+
+def _interrupted_report(exc):
+    """The CLI JSON for a PaidInterrupted."""
+    report = dict(exc.extra, paid=exc.paid, error=exc.reason, message=exc.message)
+    if exc.recorded is not None:
+        report["recorded"] = exc.recorded
+    if isinstance(exc.__cause__, Refused):
+        report["refused"] = exc.__cause__.reason
+    return report
 
 
 if __name__ == "__main__":
