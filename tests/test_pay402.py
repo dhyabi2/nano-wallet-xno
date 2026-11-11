@@ -1803,5 +1803,130 @@ class HardLinkedFilesAreRefused(Funded):
             self.assertEqual(handle.read(), content)
 
 
+
+def _binding(**kw):
+    binding = {"scheme": "nano-block-sig/1", "nonce": NONCE, "resource": "/api/audit"}
+    binding.update(kw)
+    return {"binding": {k: v for k, v in binding.items() if v is not _ABSENT}}
+
+
+_ABSENT = object()
+
+
+class NothingAfterTheSendEndsAsExitOne(Funded):
+    """README: "Exit 1 always means this run signed no new block". A bad binding nonce is
+    refused before signing; anything that fails once the block is recorded is the payment."""
+
+    def pay(self, seller):
+        return run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
+                   seller, self.node)
+
+    def test_a_bad_binding_nonce_is_refused_before_anything_is_signed(self):
+        for nonce in (_ABSENT, None, "", 7, ["x"], {"n": 1}):
+            seller = Seller(challenge(entry(extra=_binding(nonce=nonce))))
+            before = len(self.node.published)
+            code, out = self.pay(seller)
+            self.assertEqual((code, out["paid"], out["refused"]),
+                             (1, False, "binding_nonce_invalid"), (nonce, out))
+            self.assertEqual(len(self.node.published), before, "signed for nonce %r" % (nonce,))
+            self.assertEqual(len(seller.requests), 1, "the seller was paid-called")
+            code, out = run([URL], Seller(challenge(entry(extra=_binding(nonce=nonce)))))
+            self.assertEqual((code, out["refused"]), (1, "binding_nonce_invalid"), nonce)
+        self.assertEqual(self.sends(), [])
+
+    def test_a_binding_without_a_nonce_handed_to_pay_reports_the_payment(self):
+        """plan() refuses it; pay() called directly with such an entry must still not raise
+        a bare KeyError once the block went out."""
+        summary, _ = pay402.plan(URL, challenge(entry(extra=_binding()))["accepts"], "0.1")
+        bad = entry(extra=_binding(nonce=_ABSENT))
+        seller = Seller(challenge(bad))
+        result = pay402.pay(URL, bad, summary, self.key_file, "0.1", self.node,
+                            fetcher=seller, sleep=lambda s: None, confirm_seconds=0)
+        self.assertEqual((result["paid"], result["seller_status"], result["seller_error"]),
+                         (True, None, "KeyError"), result)
+        self.assertIn("the seller was not called", result["seller_body"])
+        self.assertEqual(result["block_hash"], _hash(self.node.published[-1]))
+        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(seller.requests, [], "the seller was called")
+
+    def test_an_error_building_the_payment_header_is_the_payment_exit_3(self):
+        for error in (KeyError("nonce"), AttributeError("encode"), ValueError("hex")):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                seller = Seller(challenge(entry()))
+                with mock.patch.object(pay402, "payment_header", side_effect=error):
+                    code, out = self.pay(seller)
+                self.assertEqual((code, out["paid"], out["seller_status"], out["seller_error"]),
+                                 (3, True, None, type(error).__name__), out)
+                self.assertNotIn("refused", out)
+                self.assertEqual(out["block_hash"], _hash(self.node.published[-1]))
+                self.assertEqual(len(seller.requests), 1, "the seller is not called")
+                self.assertEqual(len(self.sends()), 1)
+                code, out = self.pay(Seller(challenge(entry())))
+                self.assertEqual((code, out["replayed_send"]), (0, True), out)
+                self.assertEqual(len(self.sends()), 1, "a retry paid twice")
+
+    def test_a_custom_node_bug_while_confirming_is_the_payment_exit_3(self):
+        seller = Seller(challenge(entry()))
+        with mock.patch.object(self.node, "block_info", side_effect=TypeError("client bug")):
+            code, out = self.pay(seller)
+        self.assertEqual((code, out["paid"], out["confirmed"], out["seller_error"]),
+                         (3, True, False, "TypeError"), out)
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_a_seller_reply_that_cannot_be_read_is_the_payment_exit_3(self):
+        def seller(url, method="GET", data=None, headers=None, timeout=20):
+            if "X-PAYMENT" in (headers or {}):
+                return 200, {}, None        # a custom fetcher's bug: no bytes body
+            return 402, {}, json.dumps(challenge(entry())).encode()
+        code, out = self.pay(seller)
+        self.assertEqual((code, out["paid"], out["seller_status"], out["seller_error"]),
+                         (3, True, None, "AttributeError"), out)
+        self.assertNotIn("the seller was not called", out["seller_body"])
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_ctrl_c_right_after_the_send_returns_is_paid_interrupted(self):
+        """The window between _send_recorded returning (record on disk) and pay() holding
+        its return value."""
+        real = pay402._send_recorded
+
+        def send_recorded(*args, **kwargs):
+            real(*args, **kwargs)
+            raise KeyboardInterrupt     # Ctrl-C before the caller assigned the result
+        summary, entry_ = pay402.plan(URL, challenge(entry())["accepts"], "0.1")
+        with mock.patch.object(pay402, "_send_recorded", send_recorded):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                pay402.pay(URL, entry_, summary, self.key_file, "0.1", self.node,
+                           fetcher=Seller(challenge(entry())), sleep=lambda s: None)
+        self.assertIsInstance(caught.exception, pay402.PaidInterrupted)
+        self.assertEqual(caught.exception.payment["block_hash"], _hash(self.node.published[-1]))
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_a_second_ctrl_c_while_the_interrupted_report_prints_does_not_cut_it(self):
+        real_json = json
+
+        class Json:
+            fired = []
+
+            def __getattr__(self, name):
+                return getattr(real_json, name)
+
+            def dumps(self, obj, *args, **kwargs):
+                if isinstance(obj, dict) and obj.get("error") == "interrupted" and not self.fired:
+                    self.fired.append(True)
+                    os.kill(os.getpid(), signal.SIGINT)     # the second Ctrl-C
+                return real_json.dumps(obj, *args, **kwargs)
+        seller = Seller(challenge(entry()))
+        with mock.patch.object(pay402, "payment_header", side_effect=KeyboardInterrupt()), \
+                mock.patch.object(pay402, "json", Json()):
+            try:
+                code, out = self.pay(seller)
+            except KeyboardInterrupt:
+                self.fail("a second Ctrl-C escaped main() as a bare KeyboardInterrupt")
+        self.assertTrue(Json.fired)
+        self.assertEqual((code, out["paid"], out["error"]), (5, "unknown", "interrupted"), out)
+        self.assertEqual(out["block_hash"], _hash(self.node.published[-1]))
+
+
 if __name__ == "__main__":
     unittest.main()

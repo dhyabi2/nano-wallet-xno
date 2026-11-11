@@ -322,6 +322,13 @@ def plan(url, accepts, max_xno=None):
             raise Refused("binding_resource_mismatch",
                           "the seller's binding is for resource %r but you asked for %r: not paying"
                           % (binding.get("resource"), wanted))
+        nonce = binding.get("nonce")
+        if not isinstance(nonce, str) or not nonce:
+            # The nonce is signed into the payment header only after the block is published:
+            # a missing or non-string one is refused here, before anything is signed.
+            raise Refused("binding_nonce_invalid",
+                          "the seller's binding nonce %r is not a non-empty string: not paying"
+                          % (nonce,))
         out["binding"] = BINDING_SCHEME
     if max_xno is not None:
         try:
@@ -702,7 +709,8 @@ def wait_confirmed(node, block_hash, seconds=30, sleep=time.sleep):
     reply cut off mid-read (nanonode.ReplyCutOff, i.e. http.client.HTTPException), ValueError,
     OSError and a reply that is not an object all read as "cannot say yet". A node without
     block_info (NotImplementedError) cannot say, so it is False at once rather than polled. Anything else a custom node client
-    raises (a TypeError, say) is a bug in that client and propagates, as it did before."""
+    raises (a TypeError, say) is a bug in that client and propagates out of here; pay() then
+    reports the payment (made and recorded) with "seller_status": null rather than raising."""
     deadline = time.time() + seconds
     while True:
         try:
@@ -757,36 +765,60 @@ def pay(url, entry, summary, key_file, max_xno, node, method="GET", data=None,
     # answered, a Ctrl-C anywhere - the lock release, the confirmation wait, signing the
     # payment header, the seller call - is raised as PaidInterrupted (a KeyboardInterrupt
     # carrying the payment), never a bare KeyboardInterrupt and never an Exception.
-    result = None
+    # Likewise any Exception raised once the send is recorded (the lock release, a custom
+    # node client's bug while confirming, building the payment header, the seller call, reading
+    # its reply) is reported as the payment with "seller_status": null, never raised: the
+    # money moved, so it must never look like exit 1 / "nothing signed".
+    result = paid = None
     seller = False
+    sent_box = {}       # _send_recorded puts the record here while Ctrl-C is still held
     try:
         with _file_lock(ledger, "ledger-unwritable"):
-            result = _send_recorded(url, summary, source, keys, max_xno, node, ledger)
-        block_hash = result["block_hash"]
-        confirmed = wait_confirmed(node, block_hash, confirm_seconds, sleep)
+            result = _send_recorded(url, summary, source, keys, max_xno, node, ledger, sent_box)
+        paid = _paid_report(result, source, summary)
+        block_hash = paid["block_hash"]
+        paid["confirmed"] = wait_confirmed(node, block_hash, confirm_seconds, sleep)
         header = payment_header(block_hash, entry, keys.get(source))
-        paid = {"paid": True, "block_hash": block_hash, "from": source, "to": summary["pay_to"],
-                "amount_xno": summary["amount_xno"], "confirmed": confirmed,
-                "replayed_send": bool(result.get("replayed")),
-                "receipt": "https://nanolooker.com/block/%s" % block_hash}
         seller = True
-        try:
-            status, _, body = fetcher(url, method=method, data=data,
-                                      headers={"X-PAYMENT": header,
-                                               "Content-Type": "application/json"}
-                                      if data else {"X-PAYMENT": header})
-        except Exception as exc:
-            # The payment is made and recorded; only the seller call failed. Never a refusal.
-            reason = getattr(exc, "reason", type(exc).__name__)
-            return dict(paid, seller_status=None, seller_error=reason,
-                        seller_body=getattr(exc, "message", None) or str(exc))
+        status, _, body = fetcher(url, method=method, data=data,
+                                  headers={"X-PAYMENT": header,
+                                           "Content-Type": "application/json"}
+                                  if data else {"X-PAYMENT": header})
+        return dict(paid, seller_status=status,
+                    seller_body=body.decode("utf-8", "replace")[:4000])
     except PaidInterrupted:
         raise
     except KeyboardInterrupt:
         if result is None:
+            result = sent_box.get("result")
+        if result is None:
             raise       # before the record was saved: _send_recorded's own contract
         raise _interrupted_after_send(result, source, summary, ledger, seller=seller) from None
-    return dict(paid, seller_status=status, seller_body=body.decode("utf-8", "replace")[:4000])
+    except Exception as exc:
+        if result is None:
+            result = sent_box.get("result")
+        if result is None:
+            raise       # before the record was saved: _send_recorded's own contract
+        # The payment is made and recorded; only what came after it failed. Never a refusal.
+        reason = getattr(exc, "reason", None)
+        if not isinstance(reason, str) or not reason:
+            reason = type(exc).__name__
+        message = getattr(exc, "message", None)
+        if not isinstance(message, str) or not message:
+            message = str(exc) or type(exc).__name__
+        if not seller:
+            message = "the seller was not called (%s: %s)" % (type(exc).__name__, message)
+        if paid is None:
+            paid = _paid_report(result, source, summary)
+        return dict(paid, seller_status=None, seller_error=reason, seller_body=message)
+
+
+def _paid_report(result, source, summary):
+    block_hash = result["block_hash"]
+    return {"paid": True, "block_hash": block_hash, "from": source, "to": summary["pay_to"],
+            "amount_xno": summary["amount_xno"], "confirmed": False,
+            "replayed_send": bool(result.get("replayed")),
+            "receipt": "https://nanolooker.com/block/%s" % block_hash}
 
 
 def _settled_refusal(exc, ledger, key, sent):
@@ -858,9 +890,11 @@ def _duplicate_refusal(exc, ledger, key, sent):
                    % (block_hash, holder, same, key, ledger, key))
 
 
-def _send_recorded(url, summary, source, keys, max_xno, node, ledger):
+def _send_recorded(url, summary, source, keys, max_xno, node, ledger, sent_box=None):
     """Load the sent ledger, send (or settle) this payment's block and save the ledger. The
-    caller holds the ledger lock for all of it."""
+    caller holds the ledger lock for all of it. When `sent_box` (a dict) is given, the result is
+    also put in it under "result" while Ctrl-C is still held, so a Ctrl-C landing after this
+    returns but before the caller has assigned the return value still finds the payment."""
     sent = _ledger_load(ledger)
     env = {"NANO_WALLET_ALLOW_SEND": "1", "NANO_WALLET_MAX_SEND_XNO": max_xno}
     key = idempotency_key(url, summary["pay_to"], int(summary["amount_raw"]))
@@ -891,6 +925,8 @@ def _send_recorded(url, summary, source, keys, max_xno, node, ledger):
         with _SigintDeferred():
             saved = _send_and_save(source, summary, keys, node, sent, env, key, before, ledger,
                                    unknown)
+            if sent_box is not None:
+                sent_box["result"] = saved
     except KeyboardInterrupt:
         if saved is None:
             raise
@@ -1035,7 +1071,11 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
         cause = exc.__cause__
         if isinstance(cause, Refused):
             report["refused"] = cause.reason
-        out(report)
+        try:
+            with _SigintDeferred():     # a second Ctrl-C must not cut the report short
+                out(report)
+        except KeyboardInterrupt:
+            pass                        # it is reported: end by SIGINT below, as for the first
         if isinstance(cause, PaidUnrecorded):
             fallback = 4
         elif isinstance(cause, Refused):
