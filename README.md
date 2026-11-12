@@ -12,8 +12,8 @@ and run `python3 cli.py <command>` from inside it. If you want the `nano-wallet`
 command used below on your PATH, one line installs it (no dependencies):
 
 ```
-pip install git+https://github.com/dhyabi2/nano-wallet-xno
-# or pinned to the tagged release: pip install "nano-wallet-xno @ git+https://github.com/dhyabi2/nano-wallet-xno@v1.3.0"
+pip install "nano-wallet-xno @ git+https://github.com/dhyabi2/nano-wallet-xno@v1.3.0"
+# the tagged release (v1.3.0); unpinned main: pip install git+https://github.com/dhyabi2/nano-wallet-xno
 ```
 
 Every `nano-wallet <command>` in this README is the same as
@@ -378,7 +378,7 @@ and an expiry. `mandate.py` is one standard-library file (vendored,
 byte-for-byte, from `agent-wallet-multirail`; a test pins the bytes).
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate && pip install "git+https://github.com/dhyabi2/nano-wallet-xno"
+python3 -m venv .venv && . .venv/bin/activate && pip install "nano-wallet-xno @ git+https://github.com/dhyabi2/nano-wallet-xno@v1.3.0"
 mandate keygen --out operator.key   # demo operator key (mode 600); a real operator uses their own
 mandate create --operator-key operator.key --agent nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7 --total-cap-xno 0.5 --per-payment-max-xno 0.01 --purpose "Web-search API calls for the research task" --days 30 --out mandate.json
 mandate verify mandate.json
