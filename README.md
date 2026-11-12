@@ -111,6 +111,149 @@ re-run after a failure resubmits the SAME block instead of paying twice. If the 
 that paid. `tests/test_pay402.py` runs the whole flow against an in-memory node; a real payment was NOT
 run from this repository's tests, only the dry run is meant to be tried first.
 
+`--pin-file FILE` pins `payTo` per seller origin (scheme, host and port): the first read records the
+address and when it was first seen in that JSON file, and a later read of the same origin that names a
+different `payTo` is refused as `payto-changed` before anything is signed. Another host is not affected,
+the dry run prints the pin it compared against, and without `--pin-file` nothing is compared:
+
+```
+python3 pay402.py https://seller.example/api/audit --max-xno 0.1 --pin-file ~/.nano/payto-pins.json
+```
+
+The pin file fails closed: only a missing file means "no pins yet". A file that cannot be read, is a
+symlink (even a dangling one), is not a JSON object, repeats a key, or holds an entry without a non-empty
+`pay_to` and `first_seen` is refused (`pin-file-unreadable`, `pin-file-malformed`, `pin-entry-malformed`)
+and left untouched, so a damaged file never silently drops
+the other sellers' pins. Writes go through a unique temp file and an exclusive `flock` on `FILE.lock`
+(POSIX only), so concurrent runs do not lose each other's pins. The directory that holds `FILE` must
+already exist: it is not created, and a missing one is refused as `pin-file-unwritable` before anything
+(not even `FILE.lock`) is written. An empty pin file (e.g. after a crash) holds no pins: it
+is refused as `pin-file-malformed` with a message that says it is empty and names the path; it is never
+deleted for you, so remove it yourself if you have no pins to keep. A pin file that is not a regular file
+(a FIFO, a device) is refused as `pin-file-unreadable` instead of blocking. An empty `--pin-file ""` is a usage error, never "pinning off". One trailing dot on the host is the same
+origin; IDN hosts are not normalised (a Unicode host and its `xn--` form are two origins). The same
+fail-closed read now applies to the sent ledger (`ledger-unreadable` / `ledger-malformed`): reading a
+corrupt ledger as empty could pay twice. Unlike the pin file, a damaged or empty sent ledger must NOT be
+deleted: it records blocks already sent, so restore it from a backup or fix it by hand. These are tested against the in-memory fake node only.
+
+### Upgrading: a damaged sent ledger now stops --pay
+
+This is a behaviour change for everyone who runs `pay402.py --pay`, even without `--pin-file`. The sent
+ledger (`KEY_FILE.pay402-sent.json` unless you move it) used to be read as empty when it was 0 bytes,
+only whitespace, not JSON or not a JSON object, and the payment went ahead. It is now refused
+(`ledger-malformed` or `ledger-unreadable`, exit 1) before anything is signed. Why: the ledger is how a
+retry knows a block was already sent, so a lost or blanked ledger read as "nothing sent" can mean paying
+the same seller twice. A missing ledger is still fine (it means nothing has been sent yet), but a dangling symlink at the ledger path is not missing: it is refused as `ledger-unreadable` naming the path, so point the link at the real ledger or restore it. A ledger entry that is not a JSON object (e.g. `{"a": 1}`) is refused as `ledger-malformed`. A symlink to an existing ledger file is read as before. If the folder that should hold the ledger does not exist or is not writable, `--pay` is refused as `ledger-unwritable` (exit 1, naming the path) before anything is signed, because a payment that cannot be recorded could be paid again on a retry; so is a `--ledger` path ending in `/`, and the folder is checked as you typed it (`dir/missing/../sent.json` is refused when `missing` does not exist). If saving the ledger still fails after a payment was published, pay402 exits 4 (not 1: the money moved) with `"paid": true`, `"recorded": false`, `"error": "ledger-unsaved"`, the block hash and the unsaved record as JSON (`unsaved_record`); `"paid": "unknown"` instead means the node's reply never arrived, so the block may or may not have landed. Either way the seller is not called: do NOT retry, add that record to the ledger by hand. If the node does not answer after the block was handed to it (a timeout, a lost reply), or any other error interrupts the send at that point, the record is saved to the ledger first and pay402 exits 5 with `"paid": "unknown"`, `"recorded": true`, the error and the block hash: the money may have moved, and a retry with the same ledger is safe, because it settles that same block (one hash, so at most one payment) instead of paying again. Exit 1 means this run signed no new block, with one exception: a `SystemExit(1)` that your own node client raises during the send is raised unchanged once the record is saved. `SystemExit`, or a `KeyboardInterrupt` that your own node client raises itself, at that point also saves the record first and is then raised unchanged; a Ctrl-C (`KeyboardInterrupt`) pressed at the keyboard is not raised there but held, as follows. Ctrl-C is held until the ledger is written, and it is held for the whole send, not only the save: from the moment pay402 starts building the block, through every node call the send makes (which can last as long as the node client's timeouts), until the record is on disk. One pressed in that window is delivered only then, and it is never dropped: the CLI prints `"error": "interrupted"` and the payment JSON (as it does for a Ctrl-C anywhere after the save until the seller answers: the ledger lock release, the confirmation wait, signing the payment header, the seller call), never a bare traceback, and then ends itself by SIGINT like any Ctrl-C, so a shell loop running pay402 stops (shell status 130); from Python, `pay402.pay()` raises `pay402.PaidInterrupted` there, a `KeyboardInterrupt` subclass carrying the payment in `.payment`. If the send itself then ended in an error (a node timeout, a ledger save that failed, a refusal), the Ctrl-C is still raised as `pay402.PaidInterrupted`, chained to that error (`__cause__`), with that error's details and `"interrupted_error"` naming it; the CLI prints that JSON (with `"recorded": false` and the `unsaved_record` when the save failed) and ends by SIGINT too. Before the send starts (fetching the price, waiting for the ledger lock) Ctrl-C stops pay402 at once, and nothing has been signed. If the seller cannot be reached after paying, or anything else fails once the record is saved, the result is exit 3 with `"paid": true` and `"seller_status": null` (plus `seller_error` naming the failure; a bug in your own node client's `block_info` also gives `"confirmed": false`). If that save fails as well, the error is NOT raised: pay402 exits 4 with `"paid": "unknown"` and the `unsaved_record`, exactly as above (the message names the original error); an exception raised inside the save itself is reported the same way. The ledger is saved only when this run signed (or settled) a block: a replay of a payment already recorded as settled, or a refusal before anything was signed, writes nothing and never exits 4. From Python, `pay402.pay()` raises `pay402.PaidUnrecorded` for exit 4; it is deliberately not a subclass of `pay402.Refused`, so `except Refused` does not swallow a payment that went out. For exit 5 it raises `pay402.PaidUnknown` (its `paid` is `"unknown"`, and `extra` holds the `block_hash` and the `ledger` path); it is not a subclass of `pay402.Refused` either. A retry that reaches the send and still cannot settle the block (the node is still not answering) exits 5 again, not 1 with `"paid": false`, while the ledger record for that block has no result. A retry refused before the send (the seller no longer answers 402, the price is now over `--max-xno`, a pin or ledger check fails) exits 1 with `"paid": false`: that says only that this run signed nothing; the earlier block may still have landed. Two refusals are final and exit 1 although this payment's record stays in the ledger: `send_did_not_land` (a confirmed block took the slot the recorded block was built on, so it can never land) and `duplicate_send` when the recorded block is the identical block another ledger entry already settled as its own payment. Neither paid anything for this URL. pay402 derives the idempotency key from (url, payTo, amount), so it cannot retry under a new key: every run for that URL is refused the same way until you remove that one entry (the key the message names) from the ledger by hand; the next run then signs a new block. `duplicate_send` is also raised, with no entry recorded for this URL, when the identical block is held by another ledger entry that has NOT settled yet: then retry first the URL whose payment that entry records (the message names its key), and do not remove anything while it is unsettled, because that could pay twice; run this URL again afterwards. Each payment's load, send and save of the ledger runs under an exclusive `flock` on `LEDGER.lock` (POSIX only; the file is created next to the real ledger file, so a symlink to the ledger and its real path take the same lock; a symlinked ledger is saved into the file it points at and the link is kept), so a second run on the same ledger waits until the first has saved, then sees its record and settles it instead of paying again (a lock file that cannot be opened or locked, e.g. `ENOLCK` on a filesystem without `flock`, is refused as `ledger-unwritable`, exit 1, before anything is signed). An entry for this same payment that is not shaped the way pay402 writes it is refused as `ledger-malformed`. To recover:
+
+- Empty file (0 bytes or only whitespace): if you are sure no payment was recorded in it,
+  write `{}` into it (`printf '{}' > ~/.nano/key.json.pay402-sent.json`, with your own path) and run again. If you are not
+  sure, restore it from a backup.
+- Any other damage: restore it from a backup or fix the JSON by hand. Do NOT delete it.
+
+### Upgrading: new exit codes and exceptions for --pay
+
+If a script or program reads pay402's output or calls `pay402.pay()`, check these changes:
+
+- Exit 5 with `"paid": "unknown"`, `"recorded": true`, `error`, `block_hash` and `ledger` (no
+  `refused` key): the node never answered after the block was handed to it. `error` names why:
+  on a first attempt it is the node client's own reason (e.g. `node_unreachable` for a timeout
+  or a lost reply), on a retry that still cannot settle that block it is `send_outcome_unknown`.
+  This used to be exit 1 with `"paid": false`.
+  The money may have moved; retry with the same ledger, which settles that same block.
+- Exit 4 with `"paid": true` or `"paid": "unknown"`, `"recorded": false`, `error`, `block_hash`
+  and `unsaved_record` (no `refused` key): a payment went out (or may have) and the ledger could
+  not be saved. Do NOT retry; add `unsaved_record` to the ledger by hand.
+- Exit 3 with `"paid": true` and `"seller_status": null` (plus `seller_error`): the payment was made
+  and recorded, then something failed before the seller answered: the seller could not be
+  reached, or any other error after the record was saved (building the payment header, a bug in
+  your own node client's `block_info` or fetcher, a seller reply that cannot be read). From Python, `pay402.pay()` no longer
+  raises when the seller call fails after payment: it returns the result with
+  `seller_status=None` plus a `seller_error` key (and `seller_body` holding the error text).
+- CLI: JSON with `"paid": "unknown"`, `"recorded": true`, `"error": "interrupted"`: Ctrl-C
+  landed after the block was handed to the node and its record was saved (a Ctrl-C held during
+  the send and delivered after the save, or one pressed anywhere after the save until the seller
+  answers: the ledger lock release, the confirmation wait, signing the payment header, the
+  seller call). The JSON carries `block_hash`, `ledger`, `from`, `to`, `amount_xno` and
+  `receipt`. This used to be a bare `KeyboardInterrupt` traceback. After printing it pay402
+  ends itself by SIGINT, as an uncaught Ctrl-C does, so the shell sees status 130 and a
+  `for u in ...; do nano-pay402 "$u" --pay ...; done` loop stops there and does not go on to
+  pay the next URL (bash stops a loop only for a child that died by SIGINT, not for one that
+  exited with a code). Where SIGINT cannot be delivered to the process (Windows) it exits 5
+  instead. A Ctrl-C held during a send that then failed is reported the same way, never
+  dropped: `"interrupted_error"` names the send's own error, and the JSON carries that error's
+  fields (`"recorded": false` plus `unsaved_record` when the ledger save failed, the Windows
+  fallback then being exit 4; `"paid": false` plus `refused` for a refusal, fallback exit 1).
+  A retry with the same ledger reuses that same block.
+- Python: in that same case `pay402.pay()` raises `pay402.PaidInterrupted`, a subclass of
+  `KeyboardInterrupt` (NOT of `Exception`, and not `PaidUnknown`), so a Ctrl-C still stops your
+  program: `except Exception` or `except (Refused, PaidUnknown, PaidUnrecorded)` does not catch
+  it, and a batch loop does not go on to pay the next URL. Its `payment` attribute (also
+  `extra`) holds `block_hash`, `ledger`, `from`, `to`, `amount_xno` and `receipt`; `paid` is
+  `"unknown"` and `reason` is `"interrupted"`. Only the CLI's `main()` turns it into exit 5.
+  (Exit 5 where SIGINT cannot be delivered; on POSIX `main()` prints the JSON and then ends by
+  SIGINT, as above.) It is raised as well (chained to the error, with `paid`/`recorded` and `extra` taken from it
+  and `extra["interrupted_error"]` naming it) for a Ctrl-C pressed during the send when the
+  send then raises `PaidUnknown` (e.g. the node timed out), `PaidUnrecorded` or `Refused`: the
+  Ctrl-C is not dropped, so the loop below stops instead of handling that error and paying the
+  next URL. Calling `pay402.main()` in your own process now ends that process by SIGINT after
+  such a report (on POSIX); call `pay402.pay()` instead to keep control.
+- `HttpNanoNode` (every wallet command, not only pay402) now reports a node reply cut off
+  mid-read, or one that is not a JSON object, as a `NodeError` instead of letting
+  `http.client.HTTPException` or an `AttributeError` out. While pay402 confirms a payment, a
+  `NodeError`, a reply cut off mid-read, a `ValueError`, an `OSError` or a reply that is not an
+  object reads as `"confirmed": false`, never as a traceback; a node without `block_info`
+  (`NotImplementedError`) is `"confirmed": false` at once. Any other exception from your own
+  node client's `block_info` (a `TypeError`, say) is a bug in it: the payment is already
+  recorded, so the CLI reports it as exit 3 with `"paid": true`, `"confirmed": false` and
+  `seller_error` naming the exception (`seller_status` null), not a traceback.
+- A seller binding whose `nonce` is missing, not a string, the empty string `""` or text that
+  is not valid UTF-8 (a lone surrogate such as `"\ud800"`) is refused as
+  `binding_nonce_invalid` (exit 1, `"paid": false`) before anything is signed. main paid an
+  empty nonce `""`; it is now refused. A dry run (no `--pay`) of such a URL also exits 1 with
+  that refusal instead of 0. A binding `resource` that is not valid UTF-8 is refused as
+  `binding_resource_mismatch`.
+- A nano entry whose `extra` is present but not a JSON object (`"extra": "x"`, a number, a
+  list, `true`) is refused as `bad_extra` (exit 1, dry run too) before anything is signed; it
+  used to end in a traceback. An empty or false `extra` (`null`, `""`, `{}`, `0`, `false`,
+  `[]`) still means none, as on main.
+- After a payment, the report no longer turns into a traceback (exit 1): if stdout cannot take
+  it (closed, `nano-pay402 ... --pay | head -0`, or full, `> /dev/full`) the report is lost but
+  the exit code is still 0, 3, 4 or 5 (or the run still ends by SIGINT after a Ctrl-C). A
+  Ctrl-C while any report of a run that signed a block prints (exit 0, 3, 4, 5, and the
+  `"interrupted"` JSON) is held until it is out, then pay402 ends by SIGINT (status 130; where
+  SIGINT cannot be delivered, the exit code it would have had); so is one that lands between
+  `pay()` returning and that report starting.
+- A sent ledger or pin file with more than one hard link is refused (`ledger-unreadable` /
+  `pin-file-unreadable`, exit 1) before anything is signed: the save replaces the file, which
+  would leave the other name stale (a ledger used through both names could pay twice). Copy it
+  to a file of its own and point pay402 at the copy.
+- `"paid"` is now `true`, `false` or the string `"unknown"`. `"unknown"` is a non-empty string, so
+  it is truthy: `if out["paid"]:` treats a maybe-payment as paid. Compare `out["paid"] == True`
+  (and `== "unknown"`) explicitly.
+- `pay402.pay()` may raise `pay402.PaidUnknown` (exit 5) or `pay402.PaidUnrecorded` (exit 4).
+  Neither is a subclass of `pay402.Refused`, so `except Refused` alone lets them through. Catch
+  all three, and treat only `Refused` as "nothing was paid by this run":
+
+  ```
+  try:
+      result = pay402.pay(url, entry, summary, key_file, max_xno, node)
+  except pay402.Refused as exc:
+      ...  # exit 1/2: this run signed no new block
+  except (pay402.PaidUnknown, pay402.PaidUnrecorded) as exc:
+      ...  # exc.paid is True or "unknown"; exc.extra holds block_hash (and unsaved_record)
+  ```
+
+  or `except (Refused, PaidUnknown, PaidUnrecorded)` when one handler must see every outcome.
+  A Ctrl-C passes through both forms as `pay402.PaidInterrupted` (a `KeyboardInterrupt`) once
+  the payment is recorded, including one pressed while the send was still waiting on the node
+  that then failed; catch `pay402.PaidInterrupted` (before any bare `KeyboardInterrupt`)
+  only if you want its `payment` details, and stop the batch there.
+- `.lock` files are left next to the sent ledger (`LEDGER.lock`, beside the real file when the
+  ledger is a symlink) and next to the pin file (`FILE.lock`). They are empty and safe to leave;
+  do not delete one while pay402 runs. A `.lock` you cannot open (e.g. owned by another user) or
+  that is a symlink is refused before signing: `ledger-unwritable` for the ledger,
+  `pin-file-unwritable` for the pin file.
+
 ## Why this exists
 
 The swarm wrote to 501 outside agents, 139 answered, 1 transacted. The nearest

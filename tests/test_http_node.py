@@ -68,6 +68,44 @@ class HttpNodeAgainstRealAnswers(unittest.TestCase):
         with self.assertRaises(nanonode.NodeError):
             node.process({"type": "state", "_subtype": "send"})
 
+    def test_a_reply_cut_off_mid_read_is_a_node_error_not_a_crash(self):
+        import http.client
+
+        class _Cut(_Answer):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"blo', 40)
+        patch = mock.patch.object(urllib.request, "urlopen",
+                                  lambda request, timeout=None: _Cut(b""))
+        patch.start()
+        self.addCleanup(patch.stop)
+        node = nanonode.HttpNanoNode("https://user:key@node.example/rpc")
+        for call in (lambda: node.block_info("A" * 64), lambda: node.account_info(NEW)):
+            with self.assertRaises(nanonode.NodeError) as caught:
+                call()
+            self.assertEqual(caught.exception.reason, "node_unreachable")
+            self.assertNotIn("key", caught.exception.message)
+
+    def test_a_bad_status_line_is_a_node_error_not_a_crash(self):
+        import http.client
+
+        def urlopen(request, timeout=None):
+            raise http.client.BadStatusLine("garbage")
+        patch = mock.patch.object(urllib.request, "urlopen", urlopen)
+        patch.start()
+        self.addCleanup(patch.stop)
+        with self.assertRaises(nanonode.NodeError) as caught:
+            nanonode.HttpNanoNode("https://node.example/rpc").block_info("A" * 64)
+        self.assertEqual(caught.exception.reason, "node_unreachable")
+
+    def test_a_reply_that_is_not_a_json_object_is_a_node_error(self):
+        for answer in ([], ["confirmed"], "true", 7, None):
+            node, _ = self._node(answer)
+            for call in (lambda: node.block_info("A" * 64), lambda: node.account_info(NEW),
+                         lambda: node.receivable(NEW, 5)):
+                with self.assertRaises(nanonode.NodeError, msg=repr(answer)) as caught:
+                    call()
+                self.assertEqual(caught.exception.reason, "node_error")
+
     def test_a_block_the_node_does_not_have_is_empty_not_an_error(self):
         node, _ = self._node({"error": "Block not found"})
         self.assertEqual(node.block_info("A" * 64), {})

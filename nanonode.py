@@ -12,6 +12,7 @@ the test-suite substitutes an in-memory fake. No test in this repository
 opens a socket.
 """
 
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -25,6 +26,10 @@ DEFAULT_TIMEOUT = 10.0
 # Sent on every call. Cloudflare-fronted public nodes answer urllib's default
 # User-Agent with 403 "error code: 1010", which reads exactly like a refused key.
 USER_AGENT = "nano-wallet-xno/1.1"
+
+# A reply cut off mid-read (IncompleteRead, a bad status line). Not an OSError; named here so
+# callers that must not import the network stack themselves (pay402) can catch it.
+ReplyCutOff = http.client.HTTPException
 
 
 class NodeError(Exception):
@@ -182,6 +187,22 @@ def url_scheme(url: str) -> str:
     return urllib.parse.urlsplit(url).scheme
 
 
+def url_origin(url: str) -> str:
+    """scheme://host:port, lower-cased, default port made explicit, credentials dropped, one
+    trailing dot of a fully-qualified host removed (pay402's per-seller payTo pin key).
+    Raises ValueError for an out-of-range or non-numeric port. IDN hosts are NOT normalised:
+    a Unicode host and its xn-- punycode spelling are two origins."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    port = parts.port or {"http": 80, "https": 443}.get(scheme)
+    host = (parts.hostname or "").lower()
+    if host.endswith(".") and not host.endswith(".."):
+        host = host[:-1]
+    if ":" in host:
+        host = "[%s]" % host
+    return "%s://%s:%s" % (scheme, host, port)
+
+
 def host_of(url: str) -> str:
     """The host of a node URL, with any credentials stripped.
 
@@ -255,13 +276,23 @@ class HttpNanoNode(NanoNode):
                 "node_unreachable",
                 "could not reach the Nano node at %s: %s" % (host_of(self.url), exc.reason),
             ) from None
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, http.client.HTTPException) as exc:
+            # HTTPException: the connection broke mid-reply (IncompleteRead, a bad status
+            # line). It is not an OSError, and letting it out would read as a crash.
             raise NodeError(
                 "node_unreachable",
                 "the Nano node at %s answered something unusable: %s"
                 % (host_of(self.url), exc),
             ) from None
-        if isinstance(answer, dict) and "error" in answer:
+        if not isinstance(answer, dict):
+            # Every call reads the reply as an object; a list, string or number is not an
+            # answer to any of them.
+            raise NodeError(
+                "node_error",
+                "the Nano node at %s answered a JSON %s, not an object"
+                % (host_of(self.url), type(answer).__name__),
+            )
+        if "error" in answer:
             # A real node answers `account_info` for an account that has never
             # received with this error, not with an empty account. It is the
             # state every new wallet starts in, so it is an empty answer here
