@@ -44,8 +44,9 @@ On exit 4 the JSON carries "paid": true when the block was published, or "paid":
 when the node's reply never arrived so publication itself is uncertain, plus "recorded": false,
 "error": "ledger-unsaved", the block_hash, and the `unsaved_record` to add to the ledger by
 hand. Do NOT retry before adding it: a retry could pay twice. The seller is not called.
-Any other error during the send, Ctrl-C (KeyboardInterrupt) included, saves the signed block's
-record first and is then raised unchanged (any other exception: exit 5); Ctrl-C is held for
+Any other error during the send saves the signed block's record first; then SystemExit, or a
+KeyboardInterrupt your own node client raises itself, is raised unchanged, and any other
+exception is exit 5. A Ctrl-C pressed at the keyboard is not raised there: Ctrl-C is held for
 the whole send (every node call in it, up to the node client's timeouts) and until the ledger
 is written, then delivered, never dropped (the JSON says "error": "interrupted", as it does
 for a Ctrl-C anywhere after the save until the seller answers: the lock release, the
@@ -1034,41 +1035,157 @@ def _die_by_sigint(fallback):
     return fallback
 
 
-def _report(out, obj):
-    """Print a report after a block was signed, flushed now so a closed stdout shows up here.
-    If stdout cannot take it (BrokenPipeError when the reader is gone, e.g. `| head -0`, or any
-    other OSError, e.g. ENOSPC on `> /dev/full`) the report is lost but the run goes on to its
-    exit code: stdout is pointed at os.devnull so the interpreter's own flush at exit does not
-    fail again (Python's documented recipe for SIGPIPE)."""
+def _stdout_to_devnull():
+    """Point stdout at os.devnull once it cannot take output, so nothing later (a print, the
+    interpreter's own flush at exit) fails on it again (Python's documented recipe for
+    SIGPIPE). Never raises."""
     try:
+        if sys.stdout is None:              # fd 1 was closed at start (`pay402 ... >&-`)
+            sys.stdout = open(os.devnull, "w")
+            return
+        fd = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, fd)
+        finally:
+            if devnull != fd:
+                os.close(devnull)
+    except Exception:       # noqa: BLE001 - not a real file (a StringIO, say): nothing to do
+        pass
+
+
+def _report(out, obj):
+    """Print the report of a run that signed a block and flush it now, so a stdout that cannot
+    take it shows up here. Never raises an Exception: if stdout cannot take it (None because
+    fd 1 was closed at start, `>&-`; BrokenPipeError when the reader is gone, `| head -0`;
+    ENOSPC on `> /dev/full`; any other error while writing or flushing) the report is lost,
+    stdout is pointed at os.devnull (_stdout_to_devnull) and the run goes on to its exit code,
+    unchanged. Returns True only when the write and the flush both returned."""
+    try:
+        if sys.stdout is None:
+            _stdout_to_devnull()
+            return False
         out(obj)
         sys.stdout.flush()
-    except OSError:
+        return True
+    except Exception:       # noqa: BLE001 - see the docstring: the exit code must not change
+        _stdout_to_devnull()
+        return False
+
+
+class _PaidReport:
+    """The report and exit code of a run that signed a block (exit 0, 3, 4, 5, or a Ctrl-C
+    after paying), printed at most once, with Ctrl-C held.
+
+    main() fills it with plain attribute stores only (no call a Ctrl-C could interrupt):
+    `outcome` is pay()'s result dict or the PaidUnrecorded / PaidUnknown / PaidInterrupted it
+    raised, `summary` the plan, `interrupted` True when a Ctrl-C landed after pay() returned.
+    finish() then works out the report and the exit code, prints the report (see _report: a
+    stdout that cannot take it loses the report, never the exit code) and returns the code,
+    or ends the run by SIGINT if a Ctrl-C landed at any point (see _die_by_sigint), the code
+    being the fallback. `printed` is set only from _report's return value (the write and the
+    flush returned), never on an exception path, so a Ctrl-C that cuts a step short makes
+    finish() redo what is not done yet and never prints the report twice."""
+
+    def __init__(self, out):
+        self.out = out
+        self.outcome = None
+        self.summary = None
+        self.interrupted = False
+        self.code = None
+        self.report = None
+        self.printed = False    # the report was written and flushed (True only from _report)
+        self.lost = False       # stdout could not take it (or it could not be built): not retried
+        self.pending = []
+        self.previous = None
+        self.holding = False
+        self.cannot_hold = False
+
+    def _hold(self, signum, frame):
+        self.pending.append(signum)
+
+    def _install(self):
+        """Hold Ctrl-C from here on. A Ctrl-C that landed just before is delivered by
+        signal.signal() itself (it runs pending handlers first) as a KeyboardInterrupt with
+        nothing installed, so finish() just tries again."""
+        if self.holding or self.cannot_hold:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self.cannot_hold = True
+            return
         try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
-        except (AttributeError, OSError, ValueError):
-            pass            # not a real file (a StringIO, say): nothing is left to flush
+            if signal.getsignal(signal.SIGINT) is signal.SIG_IGN:
+                self.cannot_hold = True     # Ctrl-C is ignored here: nothing to hold
+                return
+            previous = signal.signal(signal.SIGINT, self._hold)
+        except (ValueError, OSError):
+            self.cannot_hold = True
+            return
+        self.previous, self.holding = previous, True
 
+    def _restore(self):
+        if self.holding:
+            previous = self.previous if self.previous is not None else signal.default_int_handler
+            signal.signal(signal.SIGINT, previous)
+            self.holding = False
 
-def _report_held(out, obj, code, interrupted=False, shown=None):
-    """Print the report of a run that signed a block (exit 0, 3, 4 or 5) with Ctrl-C held, so a
-    Ctrl-C cannot cut it short, and a stdout that cannot take it does not change the exit code
-    (see _report). `obj` may be a callable that builds the report, so building it is held
-    too. If a Ctrl-C was held while it printed, or `interrupted` says one already landed, the
-    run then ends by SIGINT (see _die_by_sigint), `code` being the fallback; else it is
-    returned. `shown` (a list) gets an entry once the report is printed (or lost), so a caller
-    that catches a Ctrl-C does not print it twice."""
-    try:
-        with _SigintDeferred():
-            _report(out, obj() if callable(obj) else obj)
-            if shown is not None:
-                shown.append(True)
-    except KeyboardInterrupt:
-        interrupted = True
-        if shown is not None and not shown:
-            shown.append(True)      # cut short inside out() itself: do not print it again
-    return _die_by_sigint(code) if interrupted else code
+    def _build(self):
+        """The report and the exit code for `outcome` (see main and the module docstring)."""
+        outcome = self.outcome
+        if isinstance(outcome, PaidInterrupted):
+            self.interrupted = True
+            cause = outcome.__cause__
+            if isinstance(cause, PaidUnrecorded):
+                code = 4
+            elif isinstance(cause, Refused):
+                code = 2 if cause.reason == "usage" else 1
+            else:
+                code = 5
+            report = _interrupted_report(outcome)
+        elif isinstance(outcome, PaidUnrecorded):
+            code, report = 4, dict(outcome.extra, paid=outcome.paid, recorded=False,
+                                   error=outcome.reason, message=outcome.message)
+        elif isinstance(outcome, PaidUnknown):
+            code, report = 5, dict(outcome.extra, paid="unknown", recorded=True,
+                                   error=outcome.reason, message=outcome.message)
+        else:
+            code, report = _paid_code(outcome, self.summary), outcome
+        self.report, self.code = report, code
+
+    def _fallback_code(self):
+        if self.code is not None:
+            return self.code
+        if isinstance(self.outcome, dict):
+            return 3        # paid; whether the seller accepted it could not be read
+        if isinstance(self.outcome, PaidUnrecorded):
+            return 4
+        return 5           # possibly paid and recorded (PaidUnknown / PaidInterrupted)
+
+    def finish(self):
+        for _attempt in range(3):       # bounded: a stream of Ctrl-Cs cannot loop forever
+            try:
+                self._install()
+                if self.code is None:
+                    try:
+                        self._build()
+                    except Exception:   # noqa: BLE001 - a bug building it loses the report only
+                        self.code = self._fallback_code()
+                        self.lost = True
+                if not (self.printed or self.lost):
+                    written = _report(self.out, self.report)    # never raises an Exception
+                    self.printed, self.lost = written, not written
+                self._restore()
+                break
+            except KeyboardInterrupt:
+                self.interrupted = True
+        if self.holding:                # three Ctrl-Cs raised by code, not by the terminal
+            try:
+                self._restore()
+            except KeyboardInterrupt:
+                self.interrupted = True
+        if self.interrupted or self.pending:
+            return _die_by_sigint(self._fallback_code())
+        return self._fallback_code()
 
 
 def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
@@ -1077,6 +1194,7 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
         return 0 if args else 2
+    paid = _PaidReport(out)
     try:
         do_pay = "--pay" in args
         if do_pay:
@@ -1118,53 +1236,35 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
                           "mode 600; make one with `python3 nano_keygen.py new --key-file FILE`)")
         node = node or nanonode.HttpNanoNode(node_url)
         result = None
-        interrupted = False
+        paid.summary = summary
         # The block is signed once pay() returns: from there nothing may end as exit 1 (a
-        # traceback). A Ctrl-C is held until the report is out, then ends the run by SIGINT;
-        # a stdout that cannot take the report (`| head -0`, `> /dev/full`) loses it but not
-        # the exit code.
+        # traceback). Only plain stores happen here until _PaidReport.finish() holds Ctrl-C.
         try:
             result = pay(url, entry, summary, key_file, max_xno, node, method, body, ledger,
                          fetcher, sleep)
-            code = _paid_code(result, summary)
         except KeyboardInterrupt:
             if result is None:
                 raise       # inside pay(): PaidInterrupted (below) or nothing signed yet
-            interrupted = True  # a Ctrl-C once pay() returned: report first, then SIGINT
-            code = _paid_code(result, summary)
-        report = result
-    except PaidUnrecorded as exc:
-        report, code, interrupted = (lambda e=exc: dict(e.extra, paid=e.paid, recorded=False,
-                                                        error=e.reason, message=e.message)), 4, False
-    except PaidUnknown as exc:
-        report, code, interrupted = (lambda e=exc: dict(e.extra, paid="unknown", recorded=True,
-                                                        error=e.reason, message=e.message)), 5, False
-    except PaidInterrupted as exc:
-        # The CLI alone turns a Ctrl-C after the save into JSON; pay() raises it. Then it dies
-        # by SIGINT, as an uncaught Ctrl-C would, so a shell loop running it stops too.
-        cause = exc.__cause__
-        if isinstance(cause, PaidUnrecorded):
-            fallback = 4
-        elif isinstance(cause, Refused):
-            fallback = 2 if cause.reason == "usage" else 1
-        else:
-            fallback = 5
-        report, code, interrupted = (lambda e=exc: _interrupted_report(e)), fallback, True
+            paid.interrupted = True     # a Ctrl-C once pay() returned: report, then SIGINT
+        paid.outcome = result
+    except (PaidUnrecorded, PaidUnknown, PaidInterrupted) as exc:
+        # PaidInterrupted: the CLI alone turns a Ctrl-C after the save into JSON; pay() raises
+        # it. finish() then ends the run by SIGINT, as an uncaught Ctrl-C would, so a shell
+        # loop running it stops too.
+        paid.outcome = exc
     except Refused as exc:
         out(dict(exc.extra, paid=False, refused=exc.reason, message=exc.message))
         return 2 if exc.reason == "usage" else 1
     # Every run that signed a block (exit 0, 3, 4, 5, or Ctrl-C after paying) reports here,
-    # with Ctrl-C held (a second Ctrl-C must not cut the report short) and a stdout that
-    # cannot take the report not changing the exit code. A Ctrl-C that lands in the few
-    # steps before the hold begins is caught here and reported the same way.
-    shown = []
-    try:
-        return _report_held(out, report, code, interrupted, shown)
-    except KeyboardInterrupt:
-        pass
-    if shown:
-        return _die_by_sigint(code)
-    return _report_held(out, report, code, True, shown)
+    # once, with Ctrl-C held; a stdout that cannot take the report does not change the exit
+    # code. A Ctrl-C that escapes finish() (one landing before the hold is installed, or after
+    # it is lifted) only makes it run again: what is done (the report printed) is not redone.
+    for _attempt in range(3):
+        try:
+            return paid.finish()
+        except KeyboardInterrupt:
+            paid.interrupted = True
+    return _die_by_sigint(paid._fallback_code())
 
 
 def _paid_code(result, summary):

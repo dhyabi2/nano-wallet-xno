@@ -1693,14 +1693,21 @@ def process(block):
         os.killpg(0, signal.SIGINT)     # Ctrl-C at the terminal while the node hangs
         real(block)
         raise fakenode.nanonode.NodeError("timeout", "no reply")
-    if MODE == "lost":                  # the block lands, its reply is lost: exit 5
-        real(block)
+    if MODE in ("lost", "unsaved"):     # the block lands, its reply is lost: exit 5
+        real(block)                     # (exit 4 when the ledger cannot be saved either)
         raise fakenode.nanonode.NodeError("timeout", "no reply")
     return real(block)
 
 
+def no_space(*args, **kwargs):
+    raise OSError(28, "No space left on device")
+
+
 node.process = process
-seller = t.Seller(t.challenge(t.entry()))
+if MODE == "unsaved":
+    pay402.os.replace = no_space        # the sent ledger cannot be saved
+seller = t.Seller(t.challenge(t.entry()),
+                  answer=(500, b"no") if MODE == "s500" else (200, b'{"ok": true}'))
 
 
 def fetcher(url, method="GET", data=None, headers=None, timeout=20):
@@ -1817,8 +1824,8 @@ _ABSENT = object()
 
 
 class NothingAfterTheSendEndsAsExitOne(Funded):
-    """README: "Exit 1 always means this run signed no new block". A bad binding nonce is
-    refused before signing; anything that fails once the block is recorded is the payment."""
+    """README: "Exit 1 means this run signed no new block" (bar a SystemExit from your own
+    node client). A bad binding nonce is refused before signing; anything that fails once the block is recorded is the payment."""
 
     def pay(self, seller):
         return run([URL, "--pay", "--key-file", self.key_file, "--max-xno", "0.1"],
@@ -1971,8 +1978,8 @@ def _json_hook(on_report, paid=True):
 
 
 class NoExitOneOnceTheBlockIsSigned(Funded):
-    """README: "Exit 1 always means this run signed no new block". Fields that go into the
-    binding message are checked before signing; the final report cannot turn a payment into a
+    """README: "Exit 1 means this run signed no new block" (bar a SystemExit from your own
+    node client). Fields that go into the binding message are checked before signing; the final report cannot turn a payment into a
     traceback (exit 1)."""
 
     ARGS = ["--pay", "--max-xno", "0.1"]
@@ -2171,6 +2178,263 @@ class CliStdoutOnDevFull(unittest.TestCase):
             self.assertEqual(proc.returncode, wanted, (mode, proc.stderr))
             self.assertNotIn("Traceback", proc.stderr, mode)
             self.assertEqual(sends, [URL], mode)
+
+
+class _Stdout(io.StringIO):
+    """A stdout that counts the paid reports written to it and, with `error`, fails every
+    write and flush the way `| head -0` (BrokenPipeError) or `> /dev/full` (ENOSPC) does."""
+
+    def __init__(self, error=None):
+        super().__init__()
+        self.error = error
+
+    def write(self, text):
+        if self.error is not None:
+            raise self.error
+        return super().write(text)
+
+    def flush(self):
+        if self.error is not None:
+            raise self.error
+
+
+def _counting_json():
+    """A stand-in for pay402.json that counts the CLI's own reports (json.dumps with indent)."""
+    real_json = json
+
+    class Json:
+        reports = []
+
+        def __getattr__(self, name):
+            return getattr(real_json, name)
+
+        def dumps(self, obj, *args, **kwargs):
+            if "indent" in kwargs:
+                self.reports.append(obj)
+            return real_json.dumps(obj, *args, **kwargs)
+    return Json()
+
+
+class PaidReportMatrix(Funded):
+    """Every paid outcome (exit 0, 3, 4, 5, or a Ctrl-C after paying) x every stdout (one
+    that works, fd 1 closed at start so sys.stdout is None, `> /dev/full`, `| head -0`): the
+    exit code is the documented one, the report is printed at most once (exactly once when
+    stdout works) and the block is sent once."""
+
+    ARGS = ["--pay", "--max-xno", "0.1"]
+    OUTCOMES = (0, 3, 4, 5, "interrupted")
+    STDOUTS = ("ok", "closed", "full", "pipe")
+
+    def _stdout(self, kind):
+        if kind == "closed":
+            return None
+        if kind == "full":
+            return _Stdout(OSError(28, "No space left on device"))
+        if kind == "pipe":
+            return _Stdout(BrokenPipeError(32, "Broken pipe"))
+        return _Stdout()
+
+    def _ending(self, outcome):
+        stack = contextlib.ExitStack()
+        if outcome in (4, 5):
+            real = self.node.process
+
+            def process(block):
+                real(block)
+                raise fakenode.nanonode.NodeError("timeout", "no reply")
+            stack.enter_context(mock.patch.object(self.node, "process", side_effect=process))
+        if outcome == 4:
+            stack.enter_context(mock.patch.object(pay402.os, "replace",
+                                                  side_effect=OSError(28, "No space")))
+        if outcome == "interrupted":
+            stack.enter_context(mock.patch.object(pay402, "payment_header",
+                                                  side_effect=KeyboardInterrupt()))
+        answer = (500, b"no") if outcome == 3 else (200, b'{"ok": true}')
+        return stack, Seller(challenge(entry()), answer=answer)
+
+    def _main(self, seller, stdout, url, extra=None):
+        counter = _counting_json()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(mock.patch.object(pay402, "json", counter))
+            die = stack.enter_context(mock.patch.object(pay402, "_die_by_sigint",
+                                                        side_effect=lambda code: code))
+            for patch in extra or ():
+                stack.enter_context(patch)
+            try:
+                code = pay402.main([url] + self.ARGS + ["--key-file", self.key_file],
+                                   fetcher=seller, node=self.node, sleep=lambda s: None)
+            except BaseException as exc:      # noqa: BLE001 - any escape is the failure
+                self.fail("main() raised %r after paying instead of exiting" % (exc,))
+            finally:
+                if sys.stdout is not stdout and sys.stdout is not None:
+                    with contextlib.suppress(Exception):
+                        sys.stdout.close()      # the devnull stand-in for a closed stdout
+        return code, die, counter.reports
+
+    def _check(self, outcome, kind, code, die, reports, stdout, sends):
+        wanted = 5 if outcome == "interrupted" else outcome
+        where = (outcome, kind)
+        self.assertEqual(code, wanted, where)
+        if outcome == "interrupted":
+            die.assert_called_once_with(5)
+        else:
+            die.assert_not_called()
+        self.assertLessEqual(len(reports), 1, where)
+        self.assertEqual(len(self.sends()), sends, "a block was sent twice: %r" % (where,))
+        if kind == "ok":
+            self.assertEqual(len(reports), 1, where)
+            out = json.loads(stdout.getvalue())        # one JSON document: printed once
+            self.assertEqual(out["block_hash"], _hash(self.node.published[-1]), where)
+            paid = {0: True, 3: True, 4: "unknown", 5: "unknown", "interrupted": "unknown"}
+            self.assertEqual(out["paid"], paid[outcome], (where, out))
+            if outcome == "interrupted":
+                self.assertEqual(out["error"], "interrupted", out)
+
+    def test_every_outcome_with_every_stdout(self):
+        n = 0
+        for outcome in self.OUTCOMES:
+            for kind in self.STDOUTS:
+                stack, seller = self._ending(outcome)
+                stdout = self._stdout(kind)
+                with stack:
+                    code, die, reports = self._main(seller, stdout, URL + "?n=%d" % n)
+                n += 1
+                self._check(outcome, kind, code, die, reports, stdout, n)
+                self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    def test_closed_stdout_after_paying_keeps_exit_0(self):
+        """`pay402 ... >&-`: sys.stdout is None. The report is lost, the exit code is not."""
+        stack, seller = self._ending(0)
+        with stack:
+            code, die, reports = self._main(seller, None, URL)
+        self.assertEqual(code, 0)
+        die.assert_not_called()
+        self.assertEqual(len(self.sends()), 1)
+
+    def test_ctrl_c_before_the_report_hold_is_installed_still_prints_it_once(self):
+        """A Ctrl-C pending when the report's SIGINT hold is installed: signal.signal() runs
+        the pending handler first and raises KeyboardInterrupt with nothing installed. The
+        report must still be printed (once), and the run ends by SIGINT."""
+        real_signal = signal.signal
+        real_pay = pay402.pay
+        armed = []
+
+        def pay(*args, **kwargs):
+            result = real_pay(*args, **kwargs)
+            armed.append(True)
+            return result
+
+        def fake_signal(signum, handler):
+            if armed and signum == signal.SIGINT and handler not in (
+                    signal.SIG_DFL, signal.SIG_IGN, signal.default_int_handler):
+                armed.clear()
+                raise KeyboardInterrupt     # the pending Ctrl-C, before the hold is in
+            return real_signal(signum, handler)
+        for n, (outcome, wanted) in enumerate(((0, 0), (3, 3))):
+            stack, seller = self._ending(outcome)
+            stdout = _Stdout()
+            with stack:
+                code, die, reports = self._main(
+                    seller, stdout, URL + "?n=%d" % n,
+                    extra=(mock.patch.object(pay402, "pay", pay),
+                           mock.patch.object(pay402.signal, "signal", fake_signal)))
+            self.assertFalse(armed, "the hold was never installed")
+            self.assertEqual(code, wanted)
+            die.assert_called_once_with(wanted)
+            self.assertEqual(len(reports), 1, "the report was not printed exactly once")
+            out = json.loads(stdout.getvalue())
+            self.assertEqual(out["paid"], True, out)
+            self.assertEqual(len(self.sends()), n + 1)
+            self.assertEqual(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    def test_second_ctrl_c_while_classifying_an_interrupted_payment_does_not_escape(self):
+        """A second Ctrl-C while main() works out the exit code of a PaidInterrupted (the
+        isinstance checks on its cause) must not escape as a bare KeyboardInterrupt."""
+        class Sneaky(Exception):
+            fired = []
+
+            @property
+            def __class__(self):
+                if not self.fired:
+                    self.fired.append(True)
+                    raise KeyboardInterrupt     # the second Ctrl-C, inside isinstance()
+                return Sneaky
+        real_pay = pay402.pay
+
+        def pay(*args, **kwargs):
+            try:
+                return real_pay(*args, **kwargs)
+            except pay402.PaidInterrupted as exc:
+                exc.__cause__ = Sneaky("cause")
+                raise exc
+        stack, seller = self._ending("interrupted")
+        stdout = _Stdout()
+        with stack:
+            code, die, reports = self._main(seller, stdout, URL,
+                                            extra=(mock.patch.object(pay402, "pay", pay),))
+        self.assertTrue(Sneaky.fired)
+        self.assertEqual(code, 5)
+        die.assert_called_once_with(5)
+        self.assertEqual(len(reports), 1)
+        out = json.loads(stdout.getvalue())
+        self.assertEqual((out["paid"], out["error"]), ("unknown", "interrupted"), out)
+        self.assertEqual(len(self.sends()), 1)
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("bash") and os.path.exists("/dev/full"),
+                     "needs POSIX, bash and /dev/full")
+class CliPaidReportMatrix(unittest.TestCase):
+    """The real CLI (fake node) for every paid outcome x every stdout: stdout a pipe that is
+    read, fd 1 closed at start (`>&-`), `> /dev/full`, and a pipe whose reader is gone. The
+    exit status is the documented one (a Ctrl-C after paying: death by SIGINT), there is no
+    traceback, the report is printed once when stdout works, and one block is sent."""
+
+    OUTCOMES = (("ok", 0), ("s500", 3), ("unsaved", 4), ("lost", 5), ("seller", -signal.SIGINT))
+
+    def _run(self, mode, kind):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        harness = os.path.join(tmp.name, "harness.py")
+        with open(harness, "w") as handle:
+            handle.write(_HARNESS)
+        log = os.path.join(tmp.name, "sends.log")
+        open(log, "w").close()
+        url = "https://seller.example/api/first"
+        argv = [sys.executable, harness, ROOT, url, log, mode]
+        common = dict(stderr=subprocess.PIPE, text=True, timeout=120, start_new_session=True)
+        if kind == "ok":
+            proc = subprocess.run(argv, stdout=subprocess.PIPE, **common)
+        elif kind == "closed":
+            proc = subprocess.run(["bash", "-c", 'exec "$@" >&-', "closed"] + argv,
+                                  stdout=subprocess.DEVNULL, **common)
+        elif kind == "full":
+            with open("/dev/full", "w") as full:
+                proc = subprocess.run(argv, stdout=full, **common)
+        else:
+            read_end, write_end = os.pipe()
+            os.close(read_end)                  # the reader is gone before anything is written
+            try:
+                proc = subprocess.run(argv, stdout=write_end, **common)
+            finally:
+                os.close(write_end)
+        with open(log) as handle:
+            sends = handle.read().split()
+        return proc, sends, url
+
+    def test_every_outcome_with_every_stdout(self):
+        for mode, wanted in self.OUTCOMES:
+            for kind in ("ok", "closed", "full", "pipe"):
+                proc, sends, url = self._run(mode, kind)
+                where = (mode, kind, proc.stderr[-2000:])
+                self.assertEqual(proc.returncode, wanted, where)
+                self.assertNotIn("Traceback", proc.stderr, where)
+                self.assertEqual(sends, [url], where)
+                if kind == "ok":
+                    out = json.loads(proc.stdout)       # one JSON document: printed once
+                    self.assertIn("block_hash", out, where)
+                    if mode == "seller":
+                        self.assertEqual(out["error"], "interrupted", where)
 
 
 if __name__ == "__main__":
