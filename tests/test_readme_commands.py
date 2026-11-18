@@ -17,7 +17,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 README = os.path.join(ROOT, "README.md")
-INSTALL = "pip install git+https://github.com/dhyabi2/nano-wallet-xno"
+INSTALL = "pip install nano-wallet-xno"
 
 
 def readme():
@@ -37,13 +37,20 @@ class ReadmeCommands(unittest.TestCase):
 
     def test_numbered_steps_use_the_no_install_form(self):
         # The four steps are what an agent copies; they must run from a plain clone,
-        # like step 1 (python3 mcp_server.py) already does.
+        # like step 1 (python3 -m nano_wallet_xno.mcp_server) already does.
         steps = re.findall(r"^\d+\. (\S.*?)\s{2,}", readme(), re.M)
         self.assertTrue(steps, "README has no numbered steps")
         for step in steps:
             self.assertFalse(step.startswith("nano-wallet "),
                              "step needs an install that a clone does not give: " + step)
-            if step.startswith("python3 "):
+            if step.startswith("python3 -m "):
+                # `-m pkg.mod` runs pkg/mod.py; `-m pkg` runs pkg/__main__.py.
+                parts = step.split()[2].split(".")
+                target = (os.path.join(ROOT, *parts) + ".py" if len(parts) > 1
+                          else os.path.join(ROOT, parts[0], "__main__.py"))
+                self.assertTrue(os.path.exists(target),
+                                "step names a module the repo does not have: " + step)
+            elif step.startswith("python3 "):
                 script = step.split()[1]
                 self.assertTrue(os.path.exists(os.path.join(ROOT, script)),
                                 "step names a file the repo does not have: " + step)

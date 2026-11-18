@@ -6,18 +6,35 @@ No dependencies, no account, and a profile your operator can verify:
 
     create address · validate address (checksum) · balance · receive
 
-Python 3.8+ and the standard library. Nothing else. `pip install` is not
-required and there is no package to resolve — copy the directory, or clone it,
-and run `python3 cli.py <command>` from inside it. If you want the `nano-wallet`
-command used below on your PATH, one line installs it (no dependencies):
+Python 3.8+ and the standard library. Nothing else. One line installs it, with
+no dependencies, and puts the `nano-wallet` command used below on your PATH:
 
 ```
-pip install "nano-wallet-xno @ git+https://github.com/dhyabi2/nano-wallet-xno@v1.3.0"
-# the tagged release (v1.3.0); unpinned main: pip install git+https://github.com/dhyabi2/nano-wallet-xno
+pip install nano-wallet-xno
 ```
 
-Every `nano-wallet <command>` in this README is the same as
-`python3 cli.py <command>` from a clone.
+Installing is not required and there is no package to resolve: copy the
+directory, or clone it, and run `python3 -m nano_wallet_xno <command>` from its
+top level. Every `nano-wallet <command>` in this README is the same as
+`python3 -m nano_wallet_xno <command>` from a clone.
+
+**1.4.0: imports moved.** Every module now lives in the one package
+`nano_wallet_xno`; nothing else is installed at the top level. Behaviour is
+unchanged; only the import paths and the no-install commands moved:
+
+| up to 1.3.0 | from 1.4.0 |
+|---|---|
+| `import wallet` | `from nano_wallet_xno import wallet` |
+| `import payments`, `import nanonode`, ... (any module) | `from nano_wallet_xno import payments`, ... |
+| `from nanonode import HttpNanoNode` | `from nano_wallet_xno.nanonode import HttpNanoNode` |
+| `python3 cli.py <command>` | `python3 -m nano_wallet_xno <command>` |
+| `python3 mcp_server.py --profile receive-only` | `python3 -m nano_wallet_xno.mcp_server --profile receive-only` |
+| `python3 pay402.py ...`, `python3 capped_wallet.py ...` | `python3 -m nano_wallet_xno.pay402 ...`, `python3 -m nano_wallet_xno.capped_wallet ...` |
+| `python3 spend_window.py ...`, `python3 tomb_check.py ...`, `python3 identity_address.py ...` | `python3 -m nano_wallet_xno.spend_window ...` (and so on) |
+
+The console scripts (`nano-wallet`, `mandate`, `nano-keygen`, `nano-pay402`,
+`nano-capped-wallet`) keep their names. `nano_keygen.py` is still one
+standalone file and still runs as `python3 nano_keygen.py`.
 
 **If your operator will not let you spend, install it receive-only.** In that
 profile `send` is not registered at all — it is absent from `tools/list`, and
@@ -26,7 +43,7 @@ exist. One command proves it on your own machine before you ask anyone to
 approve anything:
 
 ```
-$ python3 cli.py selfcheck --profile receive-only     # or: nano-wallet selfcheck ...
+$ python3 -m nano_wallet_xno selfcheck --profile receive-only     # or: nano-wallet selfcheck ...
 ...
 selfcheck: 7/7 pass - this install can receive XNO and cannot spend it.
 ```
@@ -94,16 +111,16 @@ python3 nano_keygen.py check nano_...           # checksum-verify any address so
 Send the address, never the seed or the key file: not in a chat, an issue, a PR, a forum thread or a
 message to an agent. Nothing in it can reach the network (a test fails if it imports a socket module).
 
-**2. A one-command buyer for a `nano:mainnet` x402 seller.** `pay402.py` (`nano-pay402` once installed)
+**2. A one-command buyer for a `nano:mainnet` x402 seller.** `nano-pay402` (`python3 -m nano_wallet_xno.pay402` from a clone)
 reads the seller's 402, picks the Nano entry, checks `payTo` against its checksum and the price against
 `--max-xno`, and by default only shows what it would pay:
 
 ```
-python3 pay402.py https://seller.example/api/audit --max-xno 0.1                         # dry run, pays nothing
-python3 pay402.py https://seller.example/api/audit --pay --key-file ~/.nano/key --max-xno 0.1
+nano-pay402 https://seller.example/api/audit --max-xno 0.1                         # dry run, pays nothing
+nano-pay402 https://seller.example/api/audit --pay --key-file ~/.nano/key --max-xno 0.1
 ```
 
-`pay402.py` reaches the seller's URL, and (only with `--pay`) a node through `nanonode.py`. Paying signs one send block locally (your key never leaves the process), waits for confirmation, retries
+`nano-pay402` reaches the seller's URL, and (only with `--pay`) a node through `nanonode.py`. Paying signs one send block locally (your key never leaves the process), waits for confirmation, retries
 the request with `X-PAYMENT`, and prints the block hash and the seller's reply. It will not pay without
 `--max-xno`, does not follow redirects, refuses a seller whose payment binding it cannot make, and a
 re-run after a failure resubmits the SAME block instead of paying twice. If the seller asks for a
@@ -156,7 +173,7 @@ rather than a convention.
   "mcpServers": {
     "nano-wallet": {
       "command": "python3",
-      "args": ["/absolute/path/to/nano_wallet/mcp_server.py",
+      "args": ["-m", "nano_wallet_xno.mcp_server",
                "--profile", "receive-only"],
       "env": { "NANO_WALLET_ALLOW_SEND": "0" }
     }
@@ -178,15 +195,15 @@ receiving passes an operator policy that spending does not.
 ## Use from the command line
 
 ```
-$ python3 cli.py check nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3
+$ python3 -m nano_wallet_xno check nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3
 { "valid": true, "public_key": "E89208DD...", ... }                        # exit 0
 
-$ python3 cli.py check nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr1
+$ python3 -m nano_wallet_xno check nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr1
 { "valid": false, "reason": "bad_checksum", ... }                          # exit 1
 
-$ python3 cli.py new                       # a seed and an account, generated locally
-$ python3 cli.py derive <seed_hex> 1       # account 1 from a seed you already hold
-$ python3 cli.py raw 0.0000005             # exact XNO -> raw, integers only
+$ python3 -m nano_wallet_xno new                       # a seed and an account, generated locally
+$ python3 -m nano_wallet_xno derive <seed_hex> 1       # account 1 from a seed you already hold
+$ python3 -m nano_wallet_xno raw 0.0000005             # exact XNO -> raw, integers only
 ```
 
 `check` exits 0 for a valid address and 1 for an invalid one, so it drops into a
@@ -195,7 +212,7 @@ shell pipeline or a CI gate as-is.
 ## Use as a library
 
 ```python
-import wallet
+from nano_wallet_xno import wallet
 
 account = wallet.create_wallet()           # seed, private_key, public_key, address
 verdict = wallet.validate(their_address)   # never raises; {"valid": bool, "reason": ...}
@@ -246,14 +263,14 @@ is asked for. So do the work then:
 ```
 $ export NANO_WALLET_WORK_CACHE=~/.nano-wallet/work
 
-$ python3 cli.py work estimate
+$ python3 -m nano_wallet_xno work estimate
 { "hashes_per_second": 1581234, "workers": 4,
   "send": { "expected_hashes": 536870912, "average_seconds": 84.9 }, ... }
 
-$ python3 cli.py work pending            # the hash of the block it last published
+$ python3 -m nano_wallet_xno work pending            # the hash of the block it last published
 { "pending": ["C1B2..."], "have_work_for": [] }
 
-$ python3 cli.py work precompute         # every core, now, while nothing waits
+$ python3 -m nano_wallet_xno work precompute         # every core, now, while nothing waits
 { "precomputed": "C1B2...", "work": "0ba27e49039735a0", "seconds": 136.988,
   "difficulty": "0xffffffff9538c8f0", "covers_send": true, "workers": 4 }
 ```
@@ -352,8 +369,8 @@ Third, the sentence to paste. It is fixed in code, not templated per recipient:
 ### The four steps
 
 ```
-1. python3 mcp_server.py --profile receive-only      (or the mcp.json above)
-2. python3 cli.py selfcheck --profile receive-only   read the last line out
+1. python3 -m nano_wallet_xno.mcp_server --profile receive-only      (or the mcp.json above)
+2. python3 -m nano_wallet_xno selfcheck --profile receive-only       read the last line out
 3. create_address                                    hand over the address
 4. claim a job on the work queue, and get paid
 ```
@@ -363,9 +380,9 @@ live job to claim** — an empty queue turns it into homework.
 
 ## A wallet the agent holds itself, with a spend cap in code
 
-`capped_wallet.py` is the self-held version of the operator mandate below: a per-payment cap and a rolling 24-hour cap,
+`nano_wallet_xno/capped_wallet.py` (`nano-capped-wallet`) is the self-held version of the operator mandate below: a per-payment cap and a rolling 24-hour cap,
 enforced before anything is signed, with the key in a local mode-600 file. See
-[skills/spend-capped-wallet/SKILL.md](skills/spend-capped-wallet/SKILL.md) for the four framework-neutral tools and the setup line.
+[skills/spend-capped-wallet/SKILL.md](https://github.com/dhyabi2/nano-wallet-xno/blob/main/skills/spend-capped-wallet/SKILL.md) for the four framework-neutral tools and the setup line.
 
 ## Let your operator set a spend cap once
 
@@ -378,7 +395,7 @@ and an expiry. `mandate.py` is one standard-library file (vendored,
 byte-for-byte, from `agent-wallet-multirail`; a test pins the bytes).
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate && pip install "nano-wallet-xno @ git+https://github.com/dhyabi2/nano-wallet-xno@v1.3.0"
+python3 -m venv .venv && . .venv/bin/activate && pip install nano-wallet-xno
 mandate keygen --out operator.key   # demo operator key (mode 600); a real operator uses their own
 mandate create --operator-key operator.key --agent nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7 --total-cap-xno 0.5 --per-payment-max-xno 0.01 --purpose "Web-search API calls for the research task" --days 30 --out mandate.json
 mandate verify mandate.json
@@ -389,7 +406,7 @@ mandate status mandate.json         # remaining cap, from mandate.json.ledger.js
 there.) Then start the full profile with the mandate:
 
 ```
-NANO_WALLET_ALLOW_SEND=1 NANO_WALLET_MANDATE=/abs/path/mandate.json python3 mcp_server.py --profile full
+NANO_WALLET_ALLOW_SEND=1 NANO_WALLET_MANDATE=/abs/path/mandate.json python3 -m nano_wallet_xno.mcp_server --profile full
 ```
 
 Every `send` from the mandate's agent is then checked - signature, agent,
@@ -425,7 +442,7 @@ consent text to post and the exact commands, for receive-only or for a spend all
 
 ```
 $ python3 -m unittest discover -s tests
-Ran 362 tests — OK
+Ran 392 tests — OK
 
 $ python3 e2e_check.py
 20/20 checks passed
