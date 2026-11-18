@@ -296,7 +296,7 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
             raise Refused("cap_required", "paying requires --max-xno: an unbounded buyer is not built")
         if not key_file:
             raise Refused("key_required", "paying requires --key-file (a file holding your 64-hex private key, "
-                          "mode 600; make one with `python3 nano_keygen.py new --key-file FILE`)")
+                          "mode 600; make one with `nano-keygen new --key-file FILE`)")
         node = node or nanonode.HttpNanoNode(node_url)
         result = pay(url, entry, summary, key_file, max_xno, node, method, body, ledger, fetcher, sleep)
         out(result)

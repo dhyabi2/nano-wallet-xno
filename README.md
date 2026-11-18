@@ -31,10 +31,14 @@ unchanged; only the import paths and the no-install commands moved:
 | `python3 mcp_server.py --profile receive-only` | `python3 -m nano_wallet_xno.mcp_server --profile receive-only` |
 | `python3 pay402.py ...`, `python3 capped_wallet.py ...` | `python3 -m nano_wallet_xno.pay402 ...`, `python3 -m nano_wallet_xno.capped_wallet ...` |
 | `python3 spend_window.py ...`, `python3 tomb_check.py ...`, `python3 identity_address.py ...` | `python3 -m nano_wallet_xno.spend_window ...` (and so on) |
+| `python3 <clone> <command>` (the old root `__main__.py`) | `python3 -m nano_wallet_xno <command>` |
+| `python3 nano_keygen.py ...` from a clone | `nano-keygen ...` or `python3 -m nano_wallet_xno.nano_keygen ...` |
+| mcp.json `"args": ["/abs/path/mcp_server.py", ...]` | `"args": ["-m", "nano_wallet_xno.mcp_server", ...]` (see [Install as an MCP server](#install-as-an-mcp-server)) |
 
 The console scripts (`nano-wallet`, `mandate`, `nano-keygen`, `nano-pay402`,
-`nano-capped-wallet`) keep their names. `nano_keygen.py` is still one
-standalone file and still runs as `python3 nano_keygen.py`.
+`nano-capped-wallet`) keep their names. `nano_keygen.py` (now
+`nano_wallet_xno/nano_keygen.py` in the repository) is still one standalone
+file: downloaded on its own, as below, it runs as `python3 nano_keygen.py`.
 
 **If your operator will not let you spend, install it receive-only.** In that
 profile `send` is not registered at all — it is absent from `tools/list`, and
@@ -180,6 +184,11 @@ rather than a convention.
   }
 }
 ```
+
+`python3` here must be the interpreter that has `nano-wallet-xno` installed. If
+you installed it in a virtual environment, put that interpreter's absolute path
+in `"command"` (for example `/home/you/.venvs/nano/bin/python`); an MCP client
+does not activate your venv for you.
 
 Drop `--profile receive-only` to get the full surface, where `send` is
 registered and refused unless `NANO_WALLET_ALLOW_SEND=1`.

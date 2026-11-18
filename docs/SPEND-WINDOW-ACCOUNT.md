@@ -52,7 +52,7 @@ it even if a bug, a prompt injection or a changed config got past that, because 
 
 ## What the operator does, step by step
 
-1. Make a fresh account for the purpose (`python3 nano_keygen.py`, offline). Keep its key where the agent can reach it only if you
+1. Make a fresh account for the purpose (`nano-keygen new`, offline). Keep its key where the agent can reach it only if you
    want the agent to sign; otherwise keep it yourself and sign each batch (receive-only agents never need it).
 2. Send the ceiling to it from your own wallet. This is the only funding step and it is yours.
 3. `python3 -m nano_wallet_xno.spend_window open --purpose "..." --ceiling-raw <int> --address <that account> --approved-by "<you>" --approved-at <UTC> --approval-url <where you said so> --expires <UTC> --now <UTC>`
