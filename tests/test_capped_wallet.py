@@ -13,9 +13,9 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import capped_wallet as C      # noqa: E402
-import fakenode                # noqa: E402
-import nanonode                # noqa: E402
+from nano_wallet_xno import capped_wallet as C      # noqa: E402
+from nano_wallet_xno import fakenode                # noqa: E402
+from nano_wallet_xno import nanonode                # noqa: E402
 
 RAW = 10 ** 30
 PAYEE = "nano_1p7cqqnfo91zwcnse54f3ucyfi6xwzsbnkt3ay14cd1g6epmiygnt7jtcoa5"

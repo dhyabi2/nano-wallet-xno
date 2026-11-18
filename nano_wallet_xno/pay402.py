@@ -31,12 +31,12 @@ import re
 import sys
 import time
 
-import ed25519_blake2b as _ed
-import keystore as _keystore
-import nanoaddr
-import nanonode
-import payments
-import wallet
+from nano_wallet_xno import ed25519_blake2b as _ed
+from nano_wallet_xno import keystore as _keystore
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import nanonode
+from nano_wallet_xno import payments
+from nano_wallet_xno import wallet
 
 USER_AGENT = "nano-pay402/1.0 (+https://github.com/dhyabi2/nano-wallet-xno)"
 DEFAULT_NODE = "https://rpc.nano.to"
@@ -296,7 +296,7 @@ def main(argv=None, fetcher=fetch, node=None, sleep=time.sleep):
             raise Refused("cap_required", "paying requires --max-xno: an unbounded buyer is not built")
         if not key_file:
             raise Refused("key_required", "paying requires --key-file (a file holding your 64-hex private key, "
-                          "mode 600; make one with `python3 nano_keygen.py new --key-file FILE`)")
+                          "mode 600; make one with `nano-keygen new --key-file FILE`)")
         node = node or nanonode.HttpNanoNode(node_url)
         result = pay(url, entry, summary, key_file, max_xno, node, method, body, ledger, fetcher, sleep)
         out(result)

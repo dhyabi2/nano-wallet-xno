@@ -21,13 +21,13 @@ from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import blocks
-import cli
-import ed25519_blake2b as ed
-import mcp_server
-import nanoaddr
-import nanonode
-import wallet
+from nano_wallet_xno import blocks
+from nano_wallet_xno import cli
+from nano_wallet_xno import ed25519_blake2b as ed
+from nano_wallet_xno import mcp_server
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import nanonode
+from nano_wallet_xno import wallet
 
 BURN = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
 GENESIS_PK = "E89208DD038FBB269987689621D52292AE9C35941A7484756ECCED92A65093BA"
@@ -212,17 +212,26 @@ class TestWallet(unittest.TestCase):
         """
         import ast
         forbidden = {"socket", "http", "urllib", "requests", "ssl", "asyncio", "ftplib"}
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        here = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "nano_wallet_xno")
 
         def imports_of(module):
+            # `from nano_wallet_xno import x` and `from nano_wallet_xno.x import y`
+            # name the sibling module x, so the walk follows it like `import x`.
             with open(os.path.join(here, module + ".py")) as handle:
                 tree = ast.parse(handle.read())
             found = set()
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     found.update(alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-                    found.add(node.module.split(".")[0])
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    parts = node.module.split(".")
+                    if parts[0] == "nano_wallet_xno" and len(parts) > 1:
+                        found.add(parts[1])
+                    elif parts[0] == "nano_wallet_xno":
+                        found.update(alias.name for alias in node.names)
+                    else:
+                        found.add(parts[0])
             return found
 
         def reachable(start):
@@ -490,7 +499,7 @@ class TestHelpNamesSomethingThatExists(unittest.TestCase):
         scripts = re.search(r"\[project\.scripts\](.*?)(?:\n\[|\Z)",
                             pyproject, re.S)
         self.assertIsNotNone(scripts, "pyproject.toml has no [project.scripts]")
-        mine = re.findall(r"""^\s*([A-Za-z0-9_.-]+)\s*=\s*['"]cli:main['"]""",
+        mine = re.findall(r"""^\s*([A-Za-z0-9_.-]+)\s*=\s*['"](?:nano_wallet_xno\.)?cli:main['"]""",
                           scripts.group(1), re.M)
         self.assertTrue(
             mine, "[project.scripts] has no entry pointing at cli:main, so the "

@@ -37,10 +37,10 @@ import os
 import tempfile
 import time
 
-import keystore as _keystore
-import mandate as _mandate
-import payments
-import wallet as _wallet
+from nano_wallet_xno import keystore as _keystore
+from nano_wallet_xno import mandate as _mandate
+from nano_wallet_xno import payments
+from nano_wallet_xno import wallet as _wallet
 
 DAY_SECONDS = 24 * 3600
 DEFAULT_PER_CALL_XNO = "0.01"
@@ -295,7 +295,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     node = None
     if os.environ.get("NANO_NODE_URL") and a.cmd in ("balance", "pay"):
-        import nanonode
+        from nano_wallet_xno import nanonode
         node = nanonode.HttpNanoNode(os.environ["NANO_NODE_URL"])
     try:
         w = CappedWallet(a.home, a.per_call, a.per_day, node=node)

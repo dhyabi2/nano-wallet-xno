@@ -10,13 +10,13 @@ round away real money.
 
 import os
 
-import blocks
-import keystore as _keystore
-import mandate as _mandate
-import nanoaddr as _addr
-import nanonode
-import profiles
-import wallet
+from nano_wallet_xno import blocks
+from nano_wallet_xno import keystore as _keystore
+from nano_wallet_xno import mandate as _mandate
+from nano_wallet_xno import nanoaddr as _addr
+from nano_wallet_xno import nanonode
+from nano_wallet_xno import profiles
+from nano_wallet_xno import wallet
 
 #: The spec's error table uses `invalid_*`; nanoaddr's parser has always used
 #: `bad_*`. Map at the boundary rather than renaming the parser's codes, which

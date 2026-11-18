@@ -1,6 +1,6 @@
 """The published keygen line, held to its four claims.
 
-    echo '<create_address store=file path=nano.key>' | python3 mcp_server.py --profile receive-only
+    echo '<create_address store=file path=nano.key>' | python3 -m nano_wallet_xno.mcp_server --profile receive-only
 
   (a) the key goes into nano.key, readable only by your user (mode 0600)
   (b) the key is never printed, only the address - including on error paths
@@ -27,17 +27,17 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import mcp_server
-import payments
-import selfcheck
+from nano_wallet_xno import mcp_server
+from nano_wallet_xno import payments
+from nano_wallet_xno import selfcheck
 
-SERVER = os.path.join(ROOT, "mcp_server.py")
+SERVER = "nano_wallet_xno.mcp_server"
 REQUEST = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                       "params": {"name": "create_address",
                                  "arguments": {"store": "file", "path": "nano.key"}}})
 HEX64 = re.compile(r"[0-9A-Fa-f]{64}")
 
-#: Runs mcp_server.py as __main__ with every socket constructor and resolver
+#: Runs nano_wallet_xno.mcp_server as __main__ with every socket constructor and resolver
 #: replaced by one that records the attempt on stderr and raises.
 NO_SOCKET_LAUNCHER = r"""
 import runpy, socket, sys
@@ -50,20 +50,23 @@ class RefusedSocket(socket.socket):
 socket.socket = RefusedSocket
 socket.create_connection = refuse
 socket.getaddrinfo = refuse
-server = sys.argv[1]
+root, server = sys.argv[1], sys.argv[2]
 sys.argv = [server, "--profile", "receive-only"]
-sys.path.insert(0, __import__("os").path.dirname(server))
-runpy.run_path(server, run_name="__main__")
+sys.path.insert(0, root)
+runpy.run_module(server, run_name="__main__", alter_sys=True)
 """
 
 
 def _clean_env():
-    return {k: v for k, v in os.environ.items() if not k.startswith("NANO_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("NANO_")}
+    # Stands in for the install: the package is importable from any folder.
+    env["PYTHONPATH"] = ROOT
+    return env
 
 
 def run_line(cwd, umask=0o022, launcher=None):
-    argv = ([sys.executable, "-c", launcher, SERVER] if launcher
-            else [sys.executable, SERVER, "--profile", "receive-only"])
+    argv = ([sys.executable, "-c", launcher, ROOT, SERVER] if launcher
+            else [sys.executable, "-m", SERVER, "--profile", "receive-only"])
     out = subprocess.run(argv, input=REQUEST + "\n", capture_output=True, text=True,
                          cwd=cwd, env=_clean_env(), timeout=60,
                          preexec_fn=lambda: os.umask(umask))
@@ -234,18 +237,18 @@ class ErrorPathsDoNotLeakTheKey(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.key))
 
     def test_write_failure(self):
-        with mock.patch("keystore.os.write", side_effect=OSError(5, "Input/output error")):
+        with mock.patch("nano_wallet_xno.keystore.os.write", side_effect=OSError(5, "Input/output error")):
             response = self.call()
         self.assert_tool_error_and_nothing_left(response, "key_path_unwritable")
 
     def test_fsync_failure(self):
-        with mock.patch("keystore.os.fsync", side_effect=OSError(5, "Input/output error")):
+        with mock.patch("nano_wallet_xno.keystore.os.fsync", side_effect=OSError(5, "Input/output error")):
             response = self.call()
         self.assert_tool_error_and_nothing_left(response, "key_path_unwritable")
 
     def test_unexpected_exception_during_write(self):
         # Reaches the dispatcher's catch-all (-32603 with a one-frame traceback).
-        with mock.patch("keystore.os.write", side_effect=RuntimeError("boom")):
+        with mock.patch("nano_wallet_xno.keystore.os.write", side_effect=RuntimeError("boom")):
             response = self.call()
         self.assertTrue("error" in response or response["result"]["isError"], response)
 
@@ -270,7 +273,7 @@ class ErrorPathsDoNotLeakTheKey(unittest.TestCase):
                 return fake_stat(real_stat(path, *args, **kwargs))
             return real_stat(path, *args, **kwargs)
 
-        with mock.patch("keystore.os.fsync", fsync), mock.patch("keystore.os.stat", patched_stat):
+        with mock.patch("nano_wallet_xno.keystore.os.fsync", fsync), mock.patch("nano_wallet_xno.keystore.os.stat", patched_stat):
             return self.call()
 
     def test_filesystem_that_ignores_mode_bits_is_refused_and_key_deleted(self):

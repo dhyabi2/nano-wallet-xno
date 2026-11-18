@@ -13,10 +13,10 @@ The four operations an outside agent asked for:
     sign_message    - prove control of an address without revealing the key
 """
 
-import ed25519_blake2b as _ed
-import nanoaddr as _addr
+from nano_wallet_xno import ed25519_blake2b as _ed
+from nano_wallet_xno import nanoaddr as _addr
 
-from nanoaddr import InvalidAddress, validate  # re-exported
+from nano_wallet_xno.nanoaddr import InvalidAddress, validate  # re-exported
 
 RAW_PER_XNO = 10 ** 30
 

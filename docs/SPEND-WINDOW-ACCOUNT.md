@@ -52,13 +52,13 @@ it even if a bug, a prompt injection or a changed config got past that, because 
 
 ## What the operator does, step by step
 
-1. Make a fresh account for the purpose (`python3 nano_keygen.py`, offline). Keep its key where the agent can reach it only if you
+1. Make a fresh account for the purpose (`nano-keygen new`, offline). Keep its key where the agent can reach it only if you
    want the agent to sign; otherwise keep it yourself and sign each batch (receive-only agents never need it).
 2. Send the ceiling to it from your own wallet. This is the only funding step and it is yours.
-3. `python3 spend_window.py open --purpose "..." --ceiling-raw <int> --address <that account> --approved-by "<you>" --approved-at <UTC> --approval-url <where you said so> --expires <UTC> --now <UTC>`
-4. After each send the agent made: `python3 spend_window.py record <id> --block <hash> --amount-raw <int> --payee <nano_...> --now <UTC>`
+3. `python3 -m nano_wallet_xno.spend_window open --purpose "..." --ceiling-raw <int> --address <that account> --approved-by "<you>" --approved-at <UTC> --approval-url <where you said so> --expires <UTC> --now <UTC>`
+4. After each send the agent made: `python3 -m nano_wallet_xno.spend_window record <id> --block <hash> --amount-raw <int> --payee <nano_...> --now <UTC>`
 5. End: `close <id> --reason exhausted|expired`, or `--reason revoked --sweep-block <hash>` after sweeping the remainder back.
-6. `python3 spend_window.py feed --now <UTC> --out feed/spend_windows.json` for a byte-reproducible summary. It reports
+6. `python3 -m nano_wallet_xno.spend_window feed --now <UTC> --out feed/spend_windows.json` for a byte-reproducible summary. It reports
    `cached_approvals_outstanding: 0` always, because there is no approval to cache.
 
 ## Limits, stated plainly

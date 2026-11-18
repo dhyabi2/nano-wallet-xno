@@ -1,6 +1,6 @@
 import os, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import tomb_check as T
+from nano_wallet_xno import tomb_check as T
 
 A = "nano_3m8cz87zwxb1y16ob4bzp1eyek78qaig8ktohk7d45b18sh6u9exbowbnekr"
 NOW = 2_000_000_000

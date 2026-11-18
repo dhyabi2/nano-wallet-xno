@@ -13,7 +13,7 @@ from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-import spend_window as sw  # noqa: E402
+from nano_wallet_xno import spend_window as sw  # noqa: E402
 
 ADDR = "nano_39b311tznm9hub316enn8159ammduxnfonoaei7afzymw66wsouw9q3j9ic1"
 PAYEE = "nano_1p7cqqnfo91zwcnse54f3ucyfi6xwzsbnkt3ay14cd1g6epmiygnt7jtcoa5"
@@ -98,11 +98,12 @@ class Laws(unittest.TestCase):
         self.assertEqual((empty["open_windows"], empty["ceiling_total_raw"], empty["windows"]), (0, "0", []))
         st, _ = opened()
         self.assertEqual(sw.dump(sw.feed(st, NOW)), sw.dump(sw.feed(json.loads(sw.dump(st)), NOW)))
-        with open(os.path.join(ROOT, "spend_window.py")) as fh:
+        with open(os.path.join(ROOT, "nano_wallet_xno", "spend_window.py")) as fh:
             tree = ast.parse(fh.read())
         names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
-        names |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-        self.assertEqual(names, {"argparse", "json", "re", "sys", "nanoaddr"})
+        names |= {n.module + "." + a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                  for a in n.names}
+        self.assertEqual(names, {"argparse", "json", "re", "sys", "nano_wallet_xno.nanoaddr"})
         tree.body = [n for n in tree.body if not (isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Constant))]
         src = ast.unparse(tree)
         for word in ("socket", "urllib", "sign(", "float("):

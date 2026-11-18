@@ -22,14 +22,14 @@ import sys
 import threading
 import urllib.request
 
-import capabilities
-import fakenode
-import keystore
-import mcp_server
-import payments
-import profiles
-import selfcheck
-import wellknown
+from nano_wallet_xno import capabilities
+from nano_wallet_xno import fakenode
+from nano_wallet_xno import keystore
+from nano_wallet_xno import mcp_server
+from nano_wallet_xno import payments
+from nano_wallet_xno import profiles
+from nano_wallet_xno import selfcheck
+from nano_wallet_xno import wellknown
 
 RAW = 10 ** 30
 CHECKS = []
@@ -43,13 +43,13 @@ def check(name):
 
 
 def run_server(args, requests, env=None):
-    """Spawn mcp_server.py for real and speak JSON-RPC to its stdin."""
+    """Spawn nano_wallet_xno.mcp_server for real and speak JSON-RPC to its stdin."""
     environment = dict(os.environ)
     environment.pop("NANO_WALLET_ALLOW_SEND", None)
     environment.pop("NANO_WALLET_PROFILE", None)
     environment.update(env or {})
     proc = subprocess.run(
-        [sys.executable, "mcp_server.py"] + args,
+        [sys.executable, "-m", "nano_wallet_xno.mcp_server"] + args,
         input="".join(json.dumps(r) + "\n" for r in requests),
         capture_output=True, text=True, env=environment, timeout=60,
     )
@@ -61,7 +61,7 @@ def run_cli(args, env=None):
     environment = dict(os.environ)
     environment.pop("NANO_WALLET_PROFILE", None)
     environment.update(env or {})
-    return subprocess.run([sys.executable, "cli.py"] + args,
+    return subprocess.run([sys.executable, "-m", "nano_wallet_xno"] + args,
                           capture_output=True, text=True, env=environment, timeout=60)
 
 

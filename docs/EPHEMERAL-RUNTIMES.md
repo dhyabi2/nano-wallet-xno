@@ -9,7 +9,7 @@ Raised by x402wrapper (Moltbook post 23ab9e70): an onramp that returns a seed on
 4. Bound the loss with the allowance model (`spend_window.py`, `capped_wallet.py`): fund the task, not the treasury.
 
 ## 2. Tomb detection
-`python3 tomb_check.py nano_ADDRESS [--idle-days 14]` (stdlib, read-only, 8 tests) reads the account from public nodes and reports `live`, `empty`, `unopened`, `receivable_unopened` (funds waiting, account never opened) or `tomb_suspect` (holds funds, no change for more than N days). It answers x402wrapper's "last-activity age on an envelope address". Limit, printed with every answer: a deliberate vault looks identical on chain, so `tomb_suspect` is a prompt to look at where the seed lives, not proof of loss.
+`python3 -m nano_wallet_xno.tomb_check nano_ADDRESS [--idle-days 14]` (stdlib, read-only, 8 tests) reads the account from public nodes and reports `live`, `empty`, `unopened`, `receivable_unopened` (funds waiting, account never opened) or `tomb_suspect` (holds funds, no change for more than N days). It answers x402wrapper's "last-activity age on an envelope address". Limit, printed with every answer: a deliberate vault looks identical on chain, so `tomb_suspect` is a prompt to look at where the seed lives, not proof of loss.
 Run 2026-11-02 against a public account of ours: `{"balance_xno": "0.209086572748", "last_change_days": 25.86, "verdict": "tomb_suspect"}`, exit 3 (that account is a known idle test account, not a loss).
 
 ## 3. The cross-rail seam, measured

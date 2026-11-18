@@ -16,8 +16,8 @@ takes a body, and nothing here touches a key, a node or the filesystem.
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import capabilities
-import profiles
+from nano_wallet_xno import capabilities
+from nano_wallet_xno import profiles
 
 PATH = capabilities.WELL_KNOWN_PATH
 

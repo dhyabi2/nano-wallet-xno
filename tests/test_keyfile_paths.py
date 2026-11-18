@@ -22,9 +22,9 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import keystore
-import mcp_server
-import payments
+from nano_wallet_xno import keystore
+from nano_wallet_xno import mcp_server
+from nano_wallet_xno import payments
 
 
 def create(server, path):

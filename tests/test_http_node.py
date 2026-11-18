@@ -20,11 +20,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import keystore as _keystore  # noqa: E402
-import nanoaddr as _nanoaddr  # noqa: E402
-import nanonode  # noqa: E402
-import payments  # noqa: E402
-import work  # noqa: E402
+from nano_wallet_xno import keystore as _keystore  # noqa: E402
+from nano_wallet_xno import nanoaddr as _nanoaddr  # noqa: E402
+from nano_wallet_xno import nanonode  # noqa: E402
+from nano_wallet_xno import payments  # noqa: E402
+from nano_wallet_xno import work  # noqa: E402
 
 NEW = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
 

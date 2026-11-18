@@ -17,8 +17,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-import prework as _prework
-import work as _work
+from nano_wallet_xno import prework as _prework
+from nano_wallet_xno import work as _work
 
 DEFAULT_TIMEOUT = 10.0
 

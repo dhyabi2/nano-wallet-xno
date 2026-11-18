@@ -27,12 +27,12 @@ import os
 import sys
 import traceback
 
-import keystore as _keystore
-import nanonode
-import payments
-import prework
-import profiles
-import wallet
+from nano_wallet_xno import keystore as _keystore
+from nano_wallet_xno import nanonode
+from nano_wallet_xno import payments
+from nano_wallet_xno import prework
+from nano_wallet_xno import profiles
+from nano_wallet_xno import wallet
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "nano-wallet", "version": "1.1.0"}

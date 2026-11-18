@@ -59,10 +59,10 @@
     lines.push('Post this text somewhere anyone can read (an issue comment, a gist, a page on your site). That URL is your approval record.');
     out.ok = true;
     out.consentText = lines.join('\n');
-    out.commands = ['python3 cli.py check ' + address];
+    out.commands = ['python3 -m nano_wallet_xno check ' + address];
     if (mode === 'spend-window') {
       var url = String(form.approvalUrl || '').trim() || 'https://WHERE-YOU-POSTED-THE-TEXT';
-      out.commands.push('python3 spend_window.py open --purpose ' + JSON.stringify(purpose) + ' --ceiling-raw ' + ceilingRaw +
+      out.commands.push('python3 -m nano_wallet_xno.spend_window open --purpose ' + JSON.stringify(purpose) + ' --ceiling-raw ' + ceilingRaw +
         ' --address ' + address + ' --approved-by ' + JSON.stringify(approver) + ' --approved-at ' + nowIso +
         ' --approval-url ' + url + ' --expires ' + expires + ' --now ' + nowIso);
     }

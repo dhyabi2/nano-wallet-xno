@@ -11,9 +11,9 @@ import os
 import subprocess
 import sys
 
-import nanoaddr
-import profiles
-import wallet
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import profiles
+from nano_wallet_xno import wallet
 
 BURN = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
 GENESIS = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
@@ -100,8 +100,8 @@ def _():
 
 @check("the CLI exits 0 on a valid address and 1 on a bad checksum")
 def _():
-    ok = subprocess.run([sys.executable, "cli.py", "check", GENESIS], capture_output=True)
-    bad = subprocess.run([sys.executable, "cli.py", "check", GENESIS[:-1] + "1"], capture_output=True)
+    ok = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "check", GENESIS], capture_output=True)
+    bad = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "check", GENESIS[:-1] + "1"], capture_output=True)
     assert ok.returncode == 0 and json.loads(ok.stdout)["valid"] is True
     assert bad.returncode == 1 and json.loads(bad.stdout)["reason"] == "bad_checksum"
 
@@ -112,7 +112,7 @@ def _():
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
         '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
     )
-    proc = subprocess.run([sys.executable, "mcp_server.py"], input=requests,
+    proc = subprocess.run([sys.executable, "-m", "nano_wallet_xno.mcp_server"], input=requests,
                           capture_output=True, text=True)
     lines = [json.loads(line) for line in proc.stdout.splitlines()]
     assert lines[0]["result"]["serverInfo"]["name"] == "nano-wallet"
@@ -129,7 +129,7 @@ SEND_WORK = "0ba27e49039735a0"
 
 @check("a send's proof-of-work is findable without a node, and the vector proves it")
 def _():
-    import work
+    from nano_wallet_xno import work
     assert work.validates(bytes.fromhex(WORK_ROOT), SEND_WORK, work.SEND_THRESHOLD)
     # The same root's network-accepted receive work does NOT clear it, so this
     # is the two thresholds differing and not the two roots differing.
@@ -139,7 +139,7 @@ def _():
 
 @check("`work estimate` says what a send costs on THIS machine, measured")
 def _():
-    run = subprocess.run([sys.executable, "cli.py", "work", "estimate",
+    run = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "work", "estimate",
                           "--seconds", "0.1"], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
     said = json.loads(run.stdout)
@@ -153,10 +153,10 @@ def _():
 def _():
     import tempfile
 
-    import prework
-    import work
+    from nano_wallet_xno import prework
+    from nano_wallet_xno import work
     with tempfile.TemporaryDirectory() as cache:
-        run = subprocess.run([sys.executable, "cli.py", "work", "precompute",
+        run = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "work", "precompute",
                               WORK_ROOT, "--threshold", "receive",
                               "--cache", cache, "--budget", "300"],
                              capture_output=True, text=True)
@@ -170,7 +170,7 @@ def _():
         assert work.validates(bytes.fromhex(WORK_ROOT), held, work.RECEIVE_THRESHOLD)
         # Receive-grade work does not let the account send, so `pending` must
         # not count it as held.
-        listed = subprocess.run([sys.executable, "cli.py", "work", "pending",
+        listed = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "work", "pending",
                                  "--cache", cache], capture_output=True, text=True)
         assert json.loads(listed.stdout)["have_work_for"] == [], listed.stdout
 
@@ -179,12 +179,12 @@ def _():
 def _():
     import tempfile
 
-    import prework
-    import work
+    from nano_wallet_xno import prework
+    from nano_wallet_xno import work
     with tempfile.TemporaryDirectory() as cache:
         # The pinned vector stands in for the minutes-long search.
         prework.WorkCache(cache).put(WORK_ROOT, SEND_WORK)
-        run = subprocess.run([sys.executable, "cli.py", "work", "precompute",
+        run = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "work", "precompute",
                               WORK_ROOT, "--cache", cache, "--budget", "5"],
                              capture_output=True, text=True)
         assert run.returncode == 0, run.stdout + run.stderr
@@ -192,17 +192,17 @@ def _():
         assert said["already_had_it"] is True and said["work"] == SEND_WORK, said
         held = prework.WorkCache(cache).get(WORK_ROOT, work.SEND_THRESHOLD)
         assert held == SEND_WORK, held
-        listed = subprocess.run([sys.executable, "cli.py", "work", "pending",
+        listed = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "work", "pending",
                                  "--cache", cache], capture_output=True, text=True)
         assert json.loads(listed.stdout)["have_work_for"] == [WORK_ROOT], listed.stdout
 
 
 @check("the work cache is off, not defaulted, when nothing configures it")
 def _():
-    import prework
+    from nano_wallet_xno import prework
     assert prework.WorkCache.from_env({}) is None
     bare = {k: v for k, v in os.environ.items() if k != prework.CACHE_ENV}
-    run = subprocess.run([sys.executable, "cli.py", "work", "pending"],
+    run = subprocess.run([sys.executable, "-m", "nano_wallet_xno", "work", "pending"],
                          capture_output=True, text=True, env=bare)
     assert run.returncode == 2, run.stdout
     assert json.loads(run.stdout)["error"] == "no_work_cache", run.stdout
@@ -217,16 +217,28 @@ OFFLINE_MODULES = ("nanoaddr", "ed25519_blake2b", "wallet", "blocks", "keystore"
 NETWORK_MODULES = ("socket", "http", "urllib", "requests", "ssl", "asyncio", "ftplib")
 
 
+#: The wallet's modules, all inside the one package.
+PACKAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nano_wallet_xno")
+
+
 def _imports_of(module_name):
+    """Top-level imports of a package module; `from nano_wallet_xno import x`
+    and `from nano_wallet_xno.x import y` both count as importing x."""
     import ast
-    with open(module_name + ".py") as handle:
+    with open(os.path.join(PACKAGE_DIR, module_name + ".py")) as handle:
         tree = ast.parse(handle.read())
     found = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             found.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            found.add(node.module.split(".")[0])
+            parts = node.module.split(".")
+            if parts[0] == "nano_wallet_xno" and len(parts) > 1:
+                found.add(parts[1])
+            elif parts[0] == "nano_wallet_xno":
+                found.update(alias.name for alias in node.names)
+            else:
+                found.add(parts[0])
     return found
 
 
@@ -237,7 +249,7 @@ def _reachable(start):
         if name in seen:
             continue
         seen.add(name)
-        if os.path.exists(name + ".py"):
+        if os.path.exists(os.path.join(PACKAGE_DIR, name + ".py")):
             todo.extend(_imports_of(name))
     return seen
 
@@ -261,7 +273,7 @@ EXEMPT = {"nanonode.py", "wellknown.py", "selfcheck.py", "tomb_check.py",
 
 @check("nanonode.py is the ONLY module in the wallet that touches the network")
 def _():
-    for name in os.listdir("."):
+    for name in os.listdir(PACKAGE_DIR):
         if not name.endswith(".py") or name in EXEMPT:
             continue
         direct = _imports_of(name[:-3]) & set(NETWORK_MODULES)

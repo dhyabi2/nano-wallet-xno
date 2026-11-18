@@ -12,8 +12,8 @@ package can drive `receive` end to end without a node.
 
 from hashlib import blake2b
 
-import nanoaddr
-import nanonode
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import nanonode
 
 
 class FakeNode(nanonode.NanoNode):

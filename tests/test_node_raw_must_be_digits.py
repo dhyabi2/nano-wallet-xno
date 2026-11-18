@@ -38,9 +38,9 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import keystore as _keystore  # noqa: E402
-import nanonode  # noqa: E402
-import payments  # noqa: E402
+from nano_wallet_xno import keystore as _keystore  # noqa: E402
+from nano_wallet_xno import nanonode  # noqa: E402
+from nano_wallet_xno import payments  # noqa: E402
 
 ONE = 10 ** 30
 REP = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"

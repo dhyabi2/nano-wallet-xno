@@ -1,7 +1,7 @@
 import sys, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import identity_address as ia, nano_keygen as nk
+from nano_wallet_xno import identity_address as ia, nano_keygen as nk
 
 S = bytes(range(32))
 

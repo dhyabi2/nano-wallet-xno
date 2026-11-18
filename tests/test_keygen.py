@@ -11,11 +11,11 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import nano_keygen as kg
-import nanoaddr
-import wallet
+from nano_wallet_xno import nano_keygen as kg
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import wallet
 
-KEYGEN = os.path.join(ROOT, "nano_keygen.py")
+KEYGEN = os.path.join(ROOT, "nano_wallet_xno", "nano_keygen.py")
 
 
 def run(*args, env=None):

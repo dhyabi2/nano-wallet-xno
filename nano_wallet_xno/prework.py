@@ -48,7 +48,7 @@ import stat
 import tempfile
 import time
 
-import work as _work
+from nano_wallet_xno import work as _work
 
 #: Directory holding the cache. Unset means the whole feature is off.
 CACHE_ENV = "NANO_WALLET_WORK_CACHE"
