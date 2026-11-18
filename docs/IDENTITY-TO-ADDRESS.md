@@ -7,10 +7,10 @@ any payment address. Tool: [`identity_address.py`](../identity_address.py); test
    One secret gives two different public keys under the two hashes (the test proves it). An address made from the SHA-512 key has no
    private key anyone can sign with, so funds sent there are unrecoverable.
 2. **Derive instead, one way:** `nano_seed = BLAKE2b-256("xno-identity-to-nano/v1" || identity_secret)`, account index 0.
-3. Run `python3 identity_address.py --secret-file identity.key`. It prints the address and public key only; never the seed or the secret.
+3. Run `python3 -m nano_wallet_xno.identity_address --secret-file identity.key`. It prints the address and public key only; never the seed or the secret.
 4. The steward approves **one address** and one rule: *receive-only*. Publishing an address is not spending authority. Spending needs the
    same derivation on a machine the steward controls, behind its own human-in-the-loop gate.
 5. Anyone can check the address is well formed with `nano_keygen.py check <address>`; the node proves it controls it later by signing a challenge
    (see `four_check.py` in xno-call-binding: check 4).
 
-Self-test with a public throwaway vector: `python3 identity_address.py --self-test`.
+Self-test with a public throwaway vector: `python3 -m nano_wallet_xno.identity_address --self-test`.
