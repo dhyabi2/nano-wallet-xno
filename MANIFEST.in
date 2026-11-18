@@ -1,0 +1,7 @@
+include README.md LICENSE pyproject.toml agent-skill.json
+include e2e_check.py e2e_receive_only.py
+recursive-include tests *.py *.js
+recursive-include docs *
+recursive-include skills *
+recursive-include audits *.md
+global-exclude __pycache__ *.py[cod]
