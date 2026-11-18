@@ -6,7 +6,7 @@ the key is an agent runtime; if that runtime is ephemeral, the address is dead o
 distinguish from a live envelope". The chain can show the one observable that separates them from the outside: how long since
 the account last changed, while it still holds funds.
 
-  python3 tomb_check.py nano_ADDRESS [--idle-days 14] [--rpc URL,URL]
+  python3 -m nano_wallet_xno.tomb_check nano_ADDRESS [--idle-days 14] [--rpc URL,URL]
 Verdicts: unopened (nothing there), receivable_unopened (funds waiting, never opened), live (changed within --idle-days),
           tomb_suspect (holds funds, no change for longer than --idle-days), empty (opened, balance 0).
 Exit: 0 live/empty/unopened, 3 tomb_suspect or receivable_unopened, 4 no node answered, 64 usage.
@@ -15,7 +15,7 @@ a prompt to look at the runtime, not proof of loss. Fix at the source: see docs/
 """
 import argparse, json, sys, time, urllib.request, urllib.error
 
-import nanoaddr as _addr
+from nano_wallet_xno import nanoaddr as _addr
 
 RPCS = ["https://rainstorm.city/api", "https://rpc.nano.to", "https://node.somenano.com/proxy"]
 XNO = 10 ** 30

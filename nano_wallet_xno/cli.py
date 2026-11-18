@@ -29,12 +29,12 @@ Every command prints one JSON object on stdout, except `selfcheck` without
 import json
 import sys
 
-import capabilities
-import prework
-import profiles
-import selfcheck as _selfcheck
-import wallet
-import work as _work
+from nano_wallet_xno import capabilities
+from nano_wallet_xno import prework
+from nano_wallet_xno import profiles
+from nano_wallet_xno import selfcheck as _selfcheck
+from nano_wallet_xno import wallet
+from nano_wallet_xno import work as _work
 
 
 def _out(obj, code=0):
@@ -214,7 +214,7 @@ def main(argv=None) -> int:
             return _selfcheck.main(args)
 
         if command == "wellknown":                          # pragma: no cover - a loop
-            import wellknown
+            from nano_wallet_xno import wellknown
             return wellknown.main(args)
 
         if command == "xno":

@@ -31,12 +31,12 @@ import re
 import sys
 import time
 
-import ed25519_blake2b as _ed
-import keystore as _keystore
-import nanoaddr
-import nanonode
-import payments
-import wallet
+from nano_wallet_xno import ed25519_blake2b as _ed
+from nano_wallet_xno import keystore as _keystore
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import nanonode
+from nano_wallet_xno import payments
+from nano_wallet_xno import wallet
 
 USER_AGENT = "nano-pay402/1.0 (+https://github.com/dhyabi2/nano-wallet-xno)"
 DEFAULT_NODE = "https://rpc.nano.to"

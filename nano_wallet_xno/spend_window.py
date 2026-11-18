@@ -19,7 +19,7 @@ account held more than its ceiling, so the premise of the record is broken), as 
 allow-list and a send above the optional per-call cap. Any real send, sweep or funding stays with the operator:
 see docs/SPEND-WINDOW-ACCOUNT.md. 1 XNO = 10**30 raw; floats are refused everywhere.
 
-    python3 spend_window.py open --purpose "..." --ceiling-raw 50000000000000000000000000000 --address nano_... \\
+    python3 -m nano_wallet_xno.spend_window open --purpose "..." --ceiling-raw 50000000000000000000000000000 --address nano_... \\
         --approved-by "ops@example" --approved-at 2026-10-25T05:00:00Z --approval-url https://... \\
         --expires 2026-11-25T00:00:00Z --now 2026-10-25T06:00:00Z
 """
@@ -28,7 +28,7 @@ import json
 import re
 import sys
 
-import nanoaddr
+from nano_wallet_xno import nanoaddr
 
 STATE_FILE = "spend_windows.json"
 V = "spend-window-v1"

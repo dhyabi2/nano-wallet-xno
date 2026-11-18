@@ -32,11 +32,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import keystore as _keystore  # noqa: E402
-import nanonode  # noqa: E402
-import payments  # noqa: E402
-import prework  # noqa: E402
-import work  # noqa: E402
+from nano_wallet_xno import keystore as _keystore  # noqa: E402
+from nano_wallet_xno import nanonode  # noqa: E402
+from nano_wallet_xno import payments  # noqa: E402
+from nano_wallet_xno import prework  # noqa: E402
+from nano_wallet_xno import work  # noqa: E402
 
 # The real open block's root, as tests/test_work.py reads it off the mainnet.
 REAL_ROOT_HEX = "8789CF4B88407CB006F5A53F6FEEECFCDC6E56F8AE51B9BBF806317A33643490"
@@ -647,7 +647,7 @@ class ACacheThatCannotBeWrittenFailsBeforeTheSearch(unittest.TestCase):
             self.cache.put(REAL_ROOT_HEX, SEND_WORK)
 
     def test_the_cli_names_it_cache_unwritable_not_bad_root(self):
-        import cli
+        from nano_wallet_xno import cli
         out = io.StringIO()
         with mock.patch.object(work, "solve_parallel") as search, \
                 mock.patch("sys.stdout", out):
@@ -660,7 +660,7 @@ class ACacheThatCannotBeWrittenFailsBeforeTheSearch(unittest.TestCase):
 
 class PendingListsOnlyWorkASendCanUse(_CacheCase):
     def test_receive_grade_work_is_not_listed_as_held(self):
-        import cli
+        from nano_wallet_xno import cli
         self.cache.put(REAL_ROOT_HEX, RECEIVE_WORK)
         out = io.StringIO()
         with mock.patch("sys.stdout", out):
@@ -675,7 +675,7 @@ class PendingListsOnlyWorkASendCanUse(_CacheCase):
 
 class TheServerTakesItsCacheFromItsOwnEnvironment(unittest.TestCase):
     def test_env_given_to_the_server_decides_the_cache_not_os_environ(self):
-        import mcp_server
+        from nano_wallet_xno import mcp_server
         with mock.patch.dict(os.environ, {prework.CACHE_ENV: "/from/os/environ"}):
             bare = mcp_server.Server(env={"NANO_NODE_URL": "https://node.example/rpc"})
             self.assertIsNone(bare.node().prework)

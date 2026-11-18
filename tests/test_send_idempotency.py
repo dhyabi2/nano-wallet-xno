@@ -23,10 +23,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import fakenode                                                   # noqa: E402
-import keystore                                                   # noqa: E402
-import nanonode                                                   # noqa: E402
-import payments                                                   # noqa: E402
+from nano_wallet_xno import fakenode                                                   # noqa: E402
+from nano_wallet_xno import keystore                                                   # noqa: E402
+from nano_wallet_xno import nanonode                                                   # noqa: E402
+from nano_wallet_xno import payments                                                   # noqa: E402
 
 RAW = 10 ** 30
 BURN = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"

@@ -15,7 +15,7 @@ the second reading is where the approval is lost.
 
 import json
 
-import profiles
+from nano_wallet_xno import profiles
 
 VERSION = "1"
 

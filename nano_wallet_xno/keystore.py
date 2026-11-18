@@ -15,8 +15,8 @@ import errno
 import os
 import stat
 
-import ed25519_blake2b as _ed
-import nanoaddr as _addr
+from nano_wallet_xno import ed25519_blake2b as _ed
+from nano_wallet_xno import nanoaddr as _addr
 
 
 class KeyStoreError(Exception):

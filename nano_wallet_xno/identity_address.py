@@ -11,12 +11,12 @@ Derivation here (domain-separated, one-way, the identity secret is never printed
 Only the ADDRESS and PUBLIC KEY are printed. The steward approves the address; the node publishes it as
 receive-only. Spending later needs the same derivation done by whoever holds the identity secret.
 
-    python3 identity_address.py --secret-file identity.key      # file holds 32 raw bytes or 64 hex chars
-    python3 identity_address.py --self-test
+    python3 -m nano_wallet_xno.identity_address --secret-file identity.key      # file holds 32 raw bytes or 64 hex chars
+    python3 -m nano_wallet_xno.identity_address --self-test
 """
 import argparse, hashlib, sys
-import ed25519_blake2b as ed
-import nano_keygen as nk
+from nano_wallet_xno import ed25519_blake2b as ed
+from nano_wallet_xno import nano_keygen as nk
 
 DOMAIN = b"xno-identity-to-nano/v1"
 

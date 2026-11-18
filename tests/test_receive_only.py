@@ -21,18 +21,18 @@ from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import blocks
-import capabilities
-import cli
-import fakenode
-import keystore
-import mcp_server
-import nanonode
-import payments
-import profiles
-import selfcheck
-import wallet
-import wellknown
+from nano_wallet_xno import blocks
+from nano_wallet_xno import capabilities
+from nano_wallet_xno import cli
+from nano_wallet_xno import fakenode
+from nano_wallet_xno import keystore
+from nano_wallet_xno import mcp_server
+from nano_wallet_xno import nanonode
+from nano_wallet_xno import payments
+from nano_wallet_xno import profiles
+from nano_wallet_xno import selfcheck
+from nano_wallet_xno import wallet
+from nano_wallet_xno import wellknown
 
 BURN = "nano_1111111111111111111111111111111111111111111111111111hifc8npp"
 GENESIS = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
@@ -389,8 +389,8 @@ class Money(unittest.TestCase):
         address = a_new_address(keys)
         node.fund(address, RAW)
         payments.receive(address, node, keys)
-        import ed25519_blake2b as ed
-        import nanoaddr
+        from nano_wallet_xno import ed25519_blake2b as ed
+        from nano_wallet_xno import nanoaddr
         block = node.published[0]
         public_key = nanoaddr.decode(block["account"])
         digest = bytes.fromhex(fakenode._hash_of(block))

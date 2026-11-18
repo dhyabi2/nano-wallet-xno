@@ -14,8 +14,8 @@ where the money is.
 
 from hashlib import blake2b
 
-import ed25519_blake2b as _ed
-import nanoaddr as _addr
+from nano_wallet_xno import ed25519_blake2b as _ed
+from nano_wallet_xno import nanoaddr as _addr
 
 STATE_PREAMBLE = (6).to_bytes(32, "big")
 ZERO32 = bytes(32)

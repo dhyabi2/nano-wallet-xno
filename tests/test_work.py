@@ -19,7 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import work  # noqa: E402
+from nano_wallet_xno import work  # noqa: E402
 
 # The real open block, from the live network.
 REAL_ROOT = bytes.fromhex(

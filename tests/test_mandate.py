@@ -19,12 +19,12 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import fakenode
-import keystore
-import mandate as M
-import mcp_server
-import payments
-import profiles
+from nano_wallet_xno import fakenode
+from nano_wallet_xno import keystore
+from nano_wallet_xno import mandate as M
+from nano_wallet_xno import mcp_server
+from nano_wallet_xno import payments
+from nano_wallet_xno import profiles
 
 # Bump only together with agent-wallet-multirail/src/agent_wallet_multirail/mandate.py
 # and openai-agents-nano-x402/src/openai_agents_nano/mandate.py: the three copies are one file.
@@ -59,7 +59,7 @@ GOLDEN_SIGNATURE = (
 class VendoredModuleAgrees(unittest.TestCase):
 
     def test_the_vendored_file_is_the_pinned_bytes(self):
-        with open(os.path.join(ROOT, "mandate.py"), "rb") as fh:
+        with open(os.path.join(ROOT, "nano_wallet_xno", "mandate.py"), "rb") as fh:
             self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), VENDORED_SHA256)
 
     def test_golden_canonical_hash_and_signature(self):
@@ -187,7 +187,7 @@ class SendUnderAMandate(unittest.TestCase):
         real = self.node.process
 
         def lost(block):
-            raise __import__("nanonode").NodeError("node_unreachable", "timed out")
+            raise __import__("nano_wallet_xno.nanonode", fromlist=["NodeError"]).NodeError("node_unreachable", "timed out")
 
         self.node.process = lost
         with self.assertRaises(payments.ToolError):

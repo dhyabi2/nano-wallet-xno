@@ -19,12 +19,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import ed25519_blake2b as ed
-import fakenode
-import keystore
-import nanoaddr
-import payments
-import pay402
+from nano_wallet_xno import ed25519_blake2b as ed
+from nano_wallet_xno import fakenode
+from nano_wallet_xno import keystore
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import payments
+from nano_wallet_xno import pay402
 
 RAW = 10 ** 30
 SELLER_KEY = bytes.fromhex("33" * 32)

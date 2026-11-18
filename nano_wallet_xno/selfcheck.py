@@ -22,11 +22,11 @@ import json
 import socket
 import sys
 
-import keystore as _keystore
-import mcp_server
-import nanoaddr
-import payments
-import profiles
+from nano_wallet_xno import keystore as _keystore
+from nano_wallet_xno import mcp_server
+from nano_wallet_xno import nanoaddr
+from nano_wallet_xno import payments
+from nano_wallet_xno import profiles
 
 #: The burn address. Every character of it is fixed by the protocol, so it is a
 #: known-answer vector the swarm cannot influence: its public key is 32 zero
